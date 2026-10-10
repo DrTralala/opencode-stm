@@ -1,0 +1,31 @@
+# Local design and implementation notes
+docs/
+
+# Dependencies, build outputs and test artefacts
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local configuration and credentials (keep sanitised examples)
+.env
+.env.*
+!.env.example
+/config.yaml
+/config.local.yaml
+
+# Local OpenCode dependencies and scratch work
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
+.opencode/bun.lockb
+.worktrees/
+/tmp/
+
+# Logs and editor/OS files
+*.log
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
