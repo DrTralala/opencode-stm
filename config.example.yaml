@@ -1,0 +1,18 @@
+# opencode-stm example configuration. All values shown are the built-in defaults.
+# Copy this file to $XDG_CONFIG_HOME/opencode/opencode-stm/config.yaml
+# (or ~/.config/opencode/opencode-stm/config.yaml when XDG_CONFIG_HOME is unset
+# or relative). Restart OpenCode after changing configuration.
+#
+# Historical access is disabled by default. Enabling readTranscript sends selected
+# historical content to the active model provider, and enabling any historical
+# flag requires explicit user configuration plus the normal OpenCode permission
+# policy. These flags do not grant authorisation by themselves.
+review:
+  enabled: true
+  intervalMessages: 20
+  maxReminders: 3
+  backoffMultiplier: 2
+historical:
+  readTitles: false
+  renameTitles: false
+  readTranscript: false
