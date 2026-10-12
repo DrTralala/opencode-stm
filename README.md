@@ -4,14 +4,16 @@ An OpenCode plugin for session title management, driven by the agent already wor
 
 ## Status
 
-The implementation and its unit and integration tests exist in this repository, and the prototype gates for OpenCode 1.18.35 have passed (the findings are local and not part of this public repository). An independent validator re-ran the project checks and executed a live production-runtime smoke against OpenCode 1.18.35 using a loopback chat-completions mock provider: `npm run typecheck` and the full test suite passed (218 tests at that validation time; 225 after the final review-fix round, verified with the commands below), all phases of the pairing smoke passed 44/44, and the DCP hook-order checks passed 13/13 in both plugin compositions (order A and order B). Reproduce the project checks with:
+Version 0.1.0. Validation on OpenCode 1.18.35 passed `npm run typecheck` and the full test suite (225 tests). Live runtime checks against a loopback chat-completions mock provider passed 44 assertions, plus 13 assertions in each of the two DCP plugin orders.
+
+Compatibility is claimed only for what that validation exercised: OpenCode 1.18.35 with chat-completions-style providers. No claim is made for other OpenCode versions, other provider wire formats (such as the builtin OpenAI Responses API path or Anthropic), paid provider calls, or prompt-cache and billing behaviour.
+
+Reproduce the project checks with:
 
 ```sh
 npm test
 npm run typecheck
 ```
-
-Compatibility is claimed only for what that validation exercised: OpenCode 1.18.35 with chat-completions-style providers. No claim is made for other OpenCode versions, other provider wire formats (such as the builtin OpenAI Responses API path or Anthropic), paid provider calls, or prompt-cache and billing behaviour. The package is not published to npm and no release exists.
 
 ## Scope
 
@@ -22,7 +24,25 @@ Compatibility is claimed only for what that validation exercised: OpenCode 1.18.
 
 It is not a session-deletion tool and not an automatic bulk-audit service. The design uses OpenCode's SDK without a separate title-generation model or idle background model calls.
 
-## Setup (from source)
+## Setup
+
+### Install as an npm plugin (recommended)
+
+Prerequisite: OpenCode 1.18.35. OpenCode resolves and installs configured npm plugins at startup, so a global npm install is not required.
+
+Add `opencode-stm@0.1.0` to the `plugin` array in the OpenCode configuration (`opencode.json` or `opencode.jsonc` in the project directory or the user config directory):
+
+```json
+{
+  "plugin": ["opencode-stm@0.1.0"]
+}
+```
+
+If the configuration already lists plugins, append the package instead of replacing the array.
+
+Restart OpenCode afterwards. The plugin is loaded once at startup; if its configuration file is present but invalid, the plugin disables itself and prints a single diagnostic: field-level errors name the offending setting, while YAML parse or file access errors stay generic. Raw values are never echoed.
+
+### Build from source (alternate)
 
 Prerequisite: Node.js 24 or newer and npm. From a source checkout of this repository:
 
@@ -31,7 +51,7 @@ npm install
 npm run build
 ```
 
-Register the built entry point as a file plugin in the OpenCode configuration (`opencode.json` or `opencode.jsonc` in the project directory or the user config directory), using an absolute path to the built `dist/src/index.js`:
+Register the built entry point as a file plugin in the OpenCode configuration, using an absolute path to the built `dist/src/index.js`:
 
 ```json
 {
@@ -39,11 +59,23 @@ Register the built entry point as a file plugin in the OpenCode configuration (`
 }
 ```
 
-Restart OpenCode afterwards. The plugin is loaded once at startup; if its configuration file is present but invalid, the plugin disables itself and prints a single diagnostic: field-level errors name the offending setting, while YAML parse or file access errors stay generic. Raw values are never echoed. There is no npm release; a source checkout with a local build is the only installation method.
+Restart OpenCode afterwards.
 
 ## Configuration
 
-Copy `config.example.yaml` to `$XDG_CONFIG_HOME/opencode/opencode-stm/config.yaml` (or `~/.config/opencode/opencode-stm/config.yaml` when `XDG_CONFIG_HOME` is unset or relative). Every field is optional; omitted fields use the defaults shown in the example:
+Copy `config.example.yaml` to `$XDG_CONFIG_HOME/opencode/opencode-stm/config.yaml` (or `~/.config/opencode/opencode-stm/config.yaml` when `XDG_CONFIG_HOME` is unset or relative). The package ships the same example at `config.example.yaml` (for a project install, `node_modules/opencode-stm/config.example.yaml`). Every field is optional; omitted fields use the defaults shown here:
+
+```yaml
+review:
+  enabled: true
+  intervalMessages: 20
+  maxReminders: 3
+  backoffMultiplier: 2
+historical:
+  readTitles: false
+  renameTitles: false
+  readTranscript: false
+```
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
@@ -80,8 +112,6 @@ Historical access is disabled by default. Transcript review sends selected conte
 - Conversion of the injected synthetic parts to provider wire formats was verified in the prototype only for chat-completions-style providers; conversions for the builtin OpenAI Responses API path and Anthropic are not verified.
 - Other plugins that capture or log outgoing messages can record injected reminders and transcript chunks; observed diagnostic exposure of that kind occurred when the capturing plugin's own debug output was enabled.
 - State file names are hashed session identifiers. The stored metadata contains counters, title digests, lock state, and raw message and part identifiers used for anchoring and replay protection — no raw titles, no transcript text, and no session identifiers. Tool results never contain transcript text.
-
-Local design and implementation documents live under ignored `docs/` and are not included in this public repository.
 
 ## Licence
 

@@ -1,14 +1,34 @@
 {
   "name": "opencode-stm",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
+  "version": "0.1.0",
+  "description": "An OpenCode plugin for session title management, driven by the agent already working in the conversation.",
   "license": "MIT",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js",
+      "default": "./dist/src/index.js"
+    },
+    "./server": "./dist/src/index.js"
+  },
+  "files": ["dist/src", "config.example.yaml"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DrTralala/opencode-stm.git"
+  },
+  "homepage": "https://github.com/DrTralala/opencode-stm#readme",
+  "bugs": {
+    "url": "https://github.com/DrTralala/opencode-stm/issues"
+  },
   "engines": { "node": ">=24" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test \"dist/test/**/*.test.js\""
+    "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.18.35",
