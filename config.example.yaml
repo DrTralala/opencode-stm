@@ -1,4 +1,5 @@
-# opencode-stm example configuration. All values shown are the built-in defaults.
+# opencode-stm (Session Title Manager) example configuration.
+# All values shown are the built-in defaults.
 # When this file is missing at plugin startup, opencode-stm creates it here from
 # this template. Existing files are never overwritten; restart OpenCode after
 # editing. The destination is $XDG_CONFIG_HOME/opencode/opencode-stm/config.yaml
