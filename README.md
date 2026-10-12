@@ -1,6 +1,6 @@
-# opencode-stm — Session Title Manager
+# opencode-stm
 
-**STM** stands for **Session Title Manager**. `opencode-stm` is an OpenCode plugin for session title management, driven by the agent already working in the conversation.
+A session title manager for OpenCode, driven by the agent already working in the conversation.
 
 ## Status
 
