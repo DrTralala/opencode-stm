@@ -1,7 +1,9 @@
 # opencode-stm example configuration. All values shown are the built-in defaults.
-# Copy this file to $XDG_CONFIG_HOME/opencode/opencode-stm/config.yaml
+# When this file is missing at plugin startup, opencode-stm creates it here from
+# this template. Existing files are never overwritten; restart OpenCode after
+# editing. The destination is $XDG_CONFIG_HOME/opencode/opencode-stm/config.yaml
 # (or ~/.config/opencode/opencode-stm/config.yaml when XDG_CONFIG_HOME is unset
-# or relative). Restart OpenCode after changing configuration.
+# or relative).
 #
 # Historical access is disabled by default. Enabling readTranscript sends selected
 # historical content to the active model provider, and enabling any historical

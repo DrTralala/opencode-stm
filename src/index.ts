@@ -185,9 +185,10 @@ export async function createStm(input: PluginInput, runtime: StmRuntime = {}): P
   const env = runtime.env ?? process.env
   const home = runtime.home ?? homedir()
   const now = runtime.now ?? Date.now
-  // Configuration is read once at startup. An invalid or unreadable file
-  // disables every hook and tool with a setting-scoped diagnostic that never
-  // echoes the offending raw value.
+  // Configuration is read once at startup; a missing file is created from the
+  // packaged template first. An invalid or unreadable file, including a failed
+  // creation, disables every hook and tool with a setting-scoped diagnostic
+  // that never echoes the offending raw value.
   const loaded = loadConfig(env, home)
   if (!loaded.ok) {
     console.error(`[${STM_PLUGIN_ID}] disabled: ${loaded.reason}`)

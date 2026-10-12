@@ -1,7 +1,7 @@
 // test/plugin.test.ts
 import { after, test } from "node:test"
 import assert from "node:assert/strict"
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs"
 import { rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -139,6 +139,42 @@ test("invalid config disables every hook and emits a setting-scoped diagnostic",
     assert.equal(errors.length, 1)
     assert.match(errors[0]!, /review\.intervalMessages/)
     assert.equal(errors[0]!.includes("123456789"), false)
+  } finally {
+    console.error = original
+  }
+})
+
+test("plugin startup creates a missing configuration and exposes only current-session tools", async () => {
+  const configHome = track(mkdtempSync(join(tmpdir(), "stm-cfg-")))
+  const hooks = await createStm({ client: fakeClient({}).client } as unknown as PluginInput, {
+    env: { XDG_CONFIG_HOME: configHome, XDG_STATE_HOME: track(mkdtempSync(join(tmpdir(), "stm-state-"))) },
+    home: configHome,
+  })
+  const configPath = join(configHome, "opencode", "opencode-stm", "config.yaml")
+  assert.equal(readFileSync(configPath, "utf8"), readFileSync(new URL("../../config.example.yaml", import.meta.url), "utf8"))
+  assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), ["stm_title_lock", "stm_title_read", "stm_title_review"])
+})
+
+test("creation failure exposes no tools or hooks and emits one safe diagnostic", async () => {
+  const home = track(mkdtempSync(join(tmpdir(), "stm-cfg-")))
+  const dangling = join(home, "dangling")
+  symlinkSync(join(home, "missing-target"), dangling, "dir")
+  const errors: string[] = []
+  const original = console.error
+  console.error = (...args: unknown[]) => errors.push(args.join(" "))
+  try {
+    const hooks = await createStm({ client: fakeClient({}).client } as unknown as PluginInput, {
+      env: {
+        XDG_CONFIG_HOME: join(dangling, "xdg"),
+        XDG_STATE_HOME: track(mkdtempSync(join(tmpdir(), "stm-state-"))),
+      },
+      home,
+    })
+    assert.deepEqual(hooks.tool, {})
+    assert.equal(hooks["experimental.chat.messages.transform"], undefined)
+    assert.equal(hooks.event, undefined)
+    assert.equal(errors.length, 1)
+    assert.equal(errors[0], "[opencode-stm] disabled: config: user configuration could not be created")
   } finally {
     console.error = original
   }

@@ -4,7 +4,9 @@ An OpenCode plugin for session title management, driven by the agent already wor
 
 ## Status
 
-Version 0.1.0. Validation on OpenCode 1.18.35 passed `npm run typecheck` and the full test suite (225 tests). Live runtime checks against a loopback chat-completions mock provider passed 44 assertions, plus 13 assertions in each of the two DCP plugin orders.
+Version 0.2.0. 0.2.0 adds automatic creation of the user configuration file: on first plugin startup, a missing configuration file is generated from the packaged template; existing files are never overwritten; and creation or validation failures disable the plugin fail-closed. On Node.js 24, `npm run typecheck` and the full test suite (247 tests) passed against the OpenCode 1.18.35 SDK. Startup was also checked from the packed npm artifact using an isolated configuration and a fake SDK client.
+
+The live loopback chat-completions runtime checks recorded for 0.1.0 (44 assertions, plus 13 assertions in each of the two DCP plugin orders) covered tool and reminder behaviour that 0.2.0 leaves unchanged; no new live provider-path checks were run for this release.
 
 Compatibility is claimed only for what that validation exercised: OpenCode 1.18.35 with chat-completions-style providers. No claim is made for other OpenCode versions, other provider wire formats (such as the builtin OpenAI Responses API path or Anthropic), paid provider calls, or prompt-cache and billing behaviour.
 
@@ -30,17 +32,19 @@ It is not a session-deletion tool and not an automatic bulk-audit service. The d
 
 Prerequisite: OpenCode 1.18.35. OpenCode resolves and installs configured npm plugins at startup, so a global npm install is not required.
 
-Add `opencode-stm@0.1.0` to the `plugin` array in the OpenCode configuration (`opencode.json` or `opencode.jsonc` in the project directory or the user config directory):
+Add `opencode-stm@latest` to the `plugin` array in the OpenCode configuration (`opencode.json` or `opencode.jsonc` in the project directory or the user config directory):
 
 ```json
 {
-  "plugin": ["opencode-stm@0.1.0"]
+  "plugin": ["opencode-stm@latest"]
 }
 ```
 
 If the configuration already lists plugins, append the package instead of replacing the array.
 
-Restart OpenCode afterwards. The plugin is loaded once at startup; if its configuration file is present but invalid, the plugin disables itself and prints a single diagnostic: field-level errors name the offending setting, while YAML parse or file access errors stay generic. Raw values are never echoed.
+OpenCode 1.18.35 caches npm plugin installations and may reuse the cached `@latest` package instead of checking the registry on every restart, so `@latest` does not guarantee that a newly published version is picked up on the next restart. Pinning an explicit version (for example `opencode-stm@0.2.0`) is the cache-independent option when a specific release is required.
+
+Restart OpenCode afterwards. On first startup the plugin creates its configuration file if it is missing (see Configuration). The plugin is loaded once at startup; if its configuration file is present but invalid, the plugin disables itself and prints a single diagnostic: field-level errors name the offending setting, while YAML parse or file access errors stay generic. Raw values are never echoed.
 
 ### Build from source (alternate)
 
@@ -63,7 +67,7 @@ Restart OpenCode afterwards.
 
 ## Configuration
 
-Copy `config.example.yaml` to `$XDG_CONFIG_HOME/opencode/opencode-stm/config.yaml` (or `~/.config/opencode/opencode-stm/config.yaml` when `XDG_CONFIG_HOME` is unset or relative). The package ships the same example at `config.example.yaml` (for a project install, `node_modules/opencode-stm/config.example.yaml`). Every field is optional; omitted fields use the defaults shown here:
+On first plugin startup, a missing configuration file is created automatically from the packaged template; no manual copy is needed. The destination is `$XDG_CONFIG_HOME/opencode/opencode-stm/config.yaml`, falling back to `~/.config/opencode/opencode-stm/config.yaml` when `XDG_CONFIG_HOME` is unset, empty or relative. The packaged template is `config.example.yaml` (for a project install, `node_modules/opencode-stm/config.example.yaml`). Every field is optional; omitted fields use the defaults shown here:
 
 ```yaml
 review:
@@ -86,6 +90,13 @@ historical:
 | `historical.readTitles` | `false` | Exposes `stm_history_title_read` |
 | `historical.renameTitles` | `false` | Exposes `stm_history_title_rename` |
 | `historical.readTranscript` | `false` | Exposes `stm_history_transcript` and `stm_history_review_end` |
+
+Startup bootstrap behaviour:
+
+- An existing configuration file is never overwritten: it is preserved byte-for-byte, including empty, invalid and dangling-symlink entries. An existing invalid or unreadable file still disables the plugin (see Setup for the diagnostic detail).
+- The generated file contains only the defaults above, so no additional tools or permissions become active: the three current-session tools are exposed as before and the historical tools remain disabled by default.
+- A missing file that cannot be created (for example an unwritable destination) or an unusable packaged template disables the plugin with a single diagnostic that contains no raw paths or file contents; there is no fallback to in-memory defaults.
+- If the configuration file is deleted, the next startup regenerates it from the packaged template.
 
 Configuration is read once at startup; restart OpenCode after any change. Tool definitions are fixed for the lifetime of the instance. Local state is stored under `$XDG_STATE_HOME/opencode-stm/` (or `~/.local/state/opencode-stm/`) using hashed session identifiers as filenames.
 

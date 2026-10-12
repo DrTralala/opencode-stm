@@ -1,9 +1,29 @@
-import { lstatSync, readFileSync, statSync } from "node:fs"
+import { randomUUID } from "node:crypto"
+import {
+  closeSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs"
 import type { Stats } from "node:fs"
-import { isAbsolute, join } from "node:path"
+import { basename, dirname, isAbsolute, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { parseAllDocuments } from "yaml"
 
 export const CONFIG_MAX_BYTES = 64 * 1024
+
+// Located relative to the compiled module, never the working directory: from
+// dist/src/config.js this resolves to the package root, where the npm file
+// allowlist ships config.example.yaml alongside dist/src.
+const PACKAGED_TEMPLATE_PATH = fileURLToPath(new URL("../../config.example.yaml", import.meta.url))
+
+const CREATION_FAILED_REASON = "config: user configuration could not be created"
 
 export type ReviewConfig = {
   enabled: boolean
@@ -144,33 +164,167 @@ export function parseConfigText(text: string): ConfigResult {
   return { ok: true, config: { review, historical }, path: null }
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv, home: string): ConfigResult {
-  const path = resolveConfigPath(env, home)
+type ConfigFileFailure =
+  | { kind: "absent" }
+  | { kind: "status" }
+  | { kind: "not-file" }
+  | { kind: "too-large" }
+  | { kind: "unreadable" }
+  | { kind: "invalid"; reason: string }
+
+type ConfigFileRead =
+  | { state: "valid"; config: StmConfig; text: string }
+  | { state: "failed"; failure: ConfigFileFailure }
+
+function hasCode(error: unknown, code: string): boolean {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === code
+}
+
+function userFailureReason(failure: ConfigFileFailure): string {
+  switch (failure.kind) {
+    case "absent":
+    case "status":
+      return "config: file status is unreadable"
+    case "not-file":
+      return "config: path is not a regular file"
+    case "too-large":
+      return `config: file larger than ${CONFIG_MAX_BYTES} bytes`
+    case "unreadable":
+      return "config: file is unreadable"
+    case "invalid":
+      return failure.reason
+  }
+}
+
+function templateFailureReason(failure: ConfigFileFailure): string {
+  switch (failure.kind) {
+    case "absent":
+      return "config: packaged template is missing"
+    case "status":
+    case "unreadable":
+      return "config: packaged template is unreadable"
+    case "not-file":
+      return "config: packaged template is not a regular file"
+    case "too-large":
+      return `config: packaged template larger than ${CONFIG_MAX_BYTES} bytes`
+    case "invalid":
+      return "config: packaged template is invalid"
+  }
+}
+
+// Shared stat/size/parse reader. It returns the validated text alongside the
+// parsed configuration so bootstrap writes exactly what it validated instead of
+// maintaining a second defaults template.
+function readConfigFile(path: string): ConfigFileRead {
   // lstat distinguishes a truly absent entry from a dangling symlink: statSync
   // reports ENOENT for both, but an existing unusable config must fail closed.
   try {
     lstatSync(path)
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { ok: true, config: freshDefaults(), path: null }
-    }
-    return { ok: false, reason: "config: file status is unreadable" }
+    return { state: "failed", failure: hasCode(error, "ENOENT") ? { kind: "absent" } : { kind: "status" } }
   }
   let fileStat: Stats
   try {
     fileStat = statSync(path)
   } catch {
-    return { ok: false, reason: "config: file status is unreadable" }
+    return { state: "failed", failure: { kind: "status" } }
   }
-  if (!fileStat.isFile()) return { ok: false, reason: "config: path is not a regular file" }
-  const size = fileStat.size
-  if (size > CONFIG_MAX_BYTES) return { ok: false, reason: `config: file larger than ${CONFIG_MAX_BYTES} bytes` }
+  if (!fileStat.isFile()) return { state: "failed", failure: { kind: "not-file" } }
+  if (fileStat.size > CONFIG_MAX_BYTES) return { state: "failed", failure: { kind: "too-large" } }
   let text: string
   try {
     text = readFileSync(path, "utf8")
   } catch {
-    return { ok: false, reason: "config: file is unreadable" }
+    return { state: "failed", failure: { kind: "unreadable" } }
   }
   const parsed = parseConfigText(text)
-  return parsed.ok ? { ok: true, config: parsed.config, path } : parsed
+  if (!parsed.ok) return { state: "failed", failure: { kind: "invalid", reason: parsed.reason } }
+  return { state: "valid", config: parsed.config, text }
+}
+
+export type EnsureUserConfigResult = { ok: true } | { ok: false; reason: string }
+
+export function ensureUserConfig(packagedPath: string, userPath: string): EnsureUserConfigResult {
+  const template = readConfigFile(packagedPath)
+  if (template.state === "failed") return { ok: false, reason: templateFailureReason(template.failure) }
+
+  // Any existing final entry, including an empty file or a dangling symlink, is
+  // preserved as-is; validating it remains the final reader's responsibility.
+  try {
+    lstatSync(userPath)
+    return { ok: true }
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) return { ok: false, reason: "config: file status is unreadable" }
+  }
+
+  const directory = dirname(userPath)
+  let temporaryPath: string | null = null
+  let temporaryCreated = false
+  let operationError: unknown
+  const recordError = (error: unknown): void => {
+    // The first failure is preserved; later cleanup failures only add a failure
+    // where none was recorded yet, never replacing the original cause.
+    if (operationError === undefined) operationError = error
+  }
+  try {
+    // The temporary name is generated inside the protected block, before any
+    // filesystem mutation, so a randomUUID failure also fails closed cleanly.
+    temporaryPath = join(directory, `.${basename(userPath)}.${process.pid}.${randomUUID()}.tmp`)
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    // Exclusive open is the ownership decision: only once it succeeds may this
+    // attempt unlink the temporary path, even if the write or flush then fails.
+    const descriptor = openSync(temporaryPath, "wx", 0o600)
+    temporaryCreated = true
+    try {
+      writeFileSync(descriptor, template.text, { encoding: "utf8" })
+      fsyncSync(descriptor)
+    } catch (error) {
+      recordError(error)
+    }
+    try {
+      closeSync(descriptor)
+    } catch (error) {
+      recordError(error)
+    }
+    // An unflushed, unclosed or failed write is never published; the owned
+    // temporary file is removed below and the caller fails closed.
+    if (operationError === undefined) {
+      try {
+        // Hard-link publication cannot overwrite an existing destination,
+        // unlike a rename. EEXIST means a concurrent creator won.
+        linkSync(temporaryPath, userPath)
+      } catch (error) {
+        if (!hasCode(error, "EEXIST")) recordError(error)
+      }
+    }
+  } catch (error) {
+    // mkdir or openSync failed. If exclusive creation failed (EEXIST) the
+    // temporary path belongs to another creator and is never unlinked.
+    recordError(error)
+  }
+  // Only a temporary file this attempt exclusively created is unlinked. Cleanup
+  // is always attempted for an owned file, including after a write failure, and
+  // a cleanup failure also fails closed.
+  if (temporaryCreated && temporaryPath !== null) {
+    try {
+      unlinkSync(temporaryPath)
+    } catch (error) {
+      if (!hasCode(error, "ENOENT")) recordError(error)
+    }
+  }
+  return operationError === undefined ? { ok: true } : { ok: false, reason: CREATION_FAILED_REASON }
+}
+
+export function loadConfig(env: NodeJS.ProcessEnv, home: string): ConfigResult {
+  const path = resolveConfigPath(env, home)
+  // The packaged source is validated before any existing user configuration is
+  // read, matching the approved debate bootstrap: a broken shipped template
+  // disables STM instead of being skipped because a user file happens to exist.
+  const ensured = ensureUserConfig(PACKAGED_TEMPLATE_PATH, path)
+  if (!ensured.ok) return ensured
+  // One read of the final destination as the runtime source, whether it already
+  // existed or was just created, including when a concurrent creator won.
+  const final = readConfigFile(path)
+  if (final.state === "failed") return { ok: false, reason: userFailureReason(final.failure) }
+  return { ok: true, config: final.config, path }
 }
