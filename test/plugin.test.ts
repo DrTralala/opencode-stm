@@ -11,7 +11,7 @@ import { DEFAULT_CONFIG } from "../src/config.js"
 import { createOperationGuard, createStateStore, hashSessionID, hashTitle, initialMeta } from "../src/state.js"
 import { lockManually } from "../src/scheduler.js"
 import { createRootCache } from "../src/sdk.js"
-import { createTranscriptQueue } from "../src/transcript.js"
+import { createTranscriptPager } from "../src/transcript.js"
 import { createCurrentTools, type StmServices } from "../src/tools.js"
 import type { MutableMessage, MutablePart } from "../src/injection.js"
 import { fakeClient, type FakeHandler } from "./fakes.js"
@@ -45,7 +45,7 @@ function makeServices(handlers: { get?: FakeHandler; update?: FakeHandler; messa
     client,
     config: DEFAULT_CONFIG,
     state: createStateStore({ stateDir }),
-    queue: createTranscriptQueue(),
+    transcripts: createTranscriptPager(),
     roots: createRootCache(client),
     guard: createOperationGuard(),
     blocked: new Map(),
@@ -269,38 +269,35 @@ test("non-default first titles lock immediately", async () => {
   assert.equal(state.lockReason, "non-default-title")
 })
 
-test("a pending chunk is delivered into the completed tool result exactly once, even during a compaction-shaped request", async () => {
+test("a stored direct result is preserved exactly, even during a compaction-shaped request", async () => {
   const { services, stateDir, tools } = await transcriptServices()
-  const ack = JSON.parse(String(await tools.stm_history_transcript!.execute({ sessionID: "ses_hist" } as any, toolContext())))
-  assert.equal(ack.status, "ok")
+  const output = String(await tools.stm_history_transcript!.execute({ sessionID: "ses_hist" } as any, toolContext()))
+  const header = JSON.parse(output.split("\n")[0]!)
+  assert.equal(header.status, "ok")
+  assert.equal(output.includes(STM_SENTINEL), true)
 
   const toolPart: MutablePart = {
     id: "tool-1",
     type: "tool",
     tool: "stm_history_transcript",
-    state: { status: "completed", output: JSON.stringify(ack) },
+    state: { status: "completed", output },
   }
   const messages: MutableMessage[] = [
     user("m1"),
     { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [toolPart] },
     { info: { id: "summary-1", sessionID: "ses_1", role: "user", summary: { title: "s" } }, parts: [] },
   ]
+  const before = JSON.stringify(messages)
   await createTransform(services)({}, { messages } as any)
-  const output = String((toolPart.state as { output?: unknown }).output)
-  assert.ok(output.startsWith(JSON.stringify(ack)), "the ack prefix is intact")
-  assert.equal(output.includes(STM_SENTINEL), true)
+  assert.equal(JSON.stringify(messages), before, "the transform leaves the stored direct result untouched")
   assert.equal(messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-")).length, 0)
   assert.equal(JSON.stringify(readState(stateDir)).includes(STM_SENTINEL), false)
 
   await createTransform(services)({}, { messages } as any)
-  assert.equal(
-    String((toolPart.state as { output?: unknown }).output),
-    output,
-    "delivery is one-shot: no second frame is appended",
-  )
+  assert.equal(String((toolPart.state as { output?: unknown }).output), output, "no replay injection rewrites it")
 })
 
-test("dispose releases queue and cache state", async () => {
+test("dispose releases pager and cache state", async () => {
   const hooks = await createStm(
     { client: fakeClient({ get: async (options: any) => ({ data: { id: options.path.id, title: DEFAULT_TITLE } }) }).client } as unknown as PluginInput,
     { env: { XDG_CONFIG_HOME: track(mkdtempSync(join(tmpdir(), "stm-cfg-"))), XDG_STATE_HOME: track(mkdtempSync(join(tmpdir(), "stm-state-"))) }, home: tmpdir() },
@@ -357,17 +354,18 @@ test("mixed-session transform is a no-op", async () => {
   assert.equal(readdirSync(stateDir).some((entry) => entry.endsWith(".json")), false)
 })
 
-test("a missing anchor message retains the pending chunk without injection", async () => {
+test("a stored direct result for a missing message leaves the request untouched", async () => {
   const { services, tools } = await transcriptServices()
   await tools.stm_history_transcript!.execute({ sessionID: "ses_hist" } as any, toolContext("msg_gone"))
 
   const messages: MutableMessage[] = [user("m1")]
+  const before = JSON.stringify(messages)
   await createTransform(services)({}, { messages } as any)
+  assert.equal(JSON.stringify(messages), before)
   assert.equal(messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-")).length, 0)
-
-  // The chunk was not consumed by the failed attempt: it stays queued for a
-  // later transform that can match it (or for the lazy expiry).
-  assert.notEqual(services.queue.take("ses_1", 0), null)
+  // The retrieval binding is independent of the outgoing request and remains
+  // available for explicit review-end cleanup.
+  assert.equal(services.transcripts.has("ses_1"), true)
 })
 
 test("session.deleted removes only the hashed state file", async () => {
@@ -419,14 +417,17 @@ test("no transcript sentinel reaches state, tool result or reminder text", async
   })
 
   const result = String(await tools.stm_history_transcript!.execute({ sessionID: "ses_hist" } as any, toolContext()))
-  assert.equal(result.includes(STM_SENTINEL), false)
+  // The direct result carries the text; STM never duplicates it into state or
+  // into a synthetic part.
+  assert.equal(result.includes(STM_SENTINEL), true)
+  const header = JSON.parse(result.split("\n")[0]!)
+  assert.equal(header.status, "ok")
 
-  const ack = JSON.parse(result)
   const toolPart: MutablePart = {
     id: "tool-1",
     type: "tool",
     tool: "stm_history_transcript",
-    state: { status: "completed", output: JSON.stringify(ack) },
+    state: { status: "completed", output: result },
   }
   const messages: MutableMessage[] = [
     user("m1"),
@@ -439,10 +440,8 @@ test("no transcript sentinel reaches state, tool result or reminder text", async
   assert.ok(reminder, "reminder re-applied")
   assert.equal(String(reminder.text).includes(STM_SENTINEL), false)
 
-  // The delivered chunk rides the matching tool result; the ack head is intact.
-  const output = String((toolPart.state as { output?: unknown }).output)
-  assert.ok(output.startsWith(JSON.stringify(ack)), "the ack prefix is intact")
-  assert.equal(output.includes(STM_SENTINEL), true)
+  // The stored result is untouched by the reminder transform.
+  assert.equal(String((toolPart.state as { output?: unknown }).output), result)
   assert.equal(messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-")).length, 0)
 })
 

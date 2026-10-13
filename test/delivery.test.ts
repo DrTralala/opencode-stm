@@ -1,7 +1,7 @@
 // test/delivery.test.ts
-// Outbound-only transcript delivery: the queued chunk rides the matching
-// completed stm_history_transcript tool result (function_call_output) instead
-// of a synthetic assistant part. All fixture identifiers and text are invented.
+// Direct transcript results are ordinary persisted tool results. These tests
+// replay reconstructed outgoing requests built from stored results and prove
+// STM's transform never rewrites or re-injects them.
 import { after, test } from "node:test"
 import assert from "node:assert/strict"
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs"
@@ -12,15 +12,16 @@ import { createTransform } from "../src/index.js"
 import { DEFAULT_CONFIG } from "../src/config.js"
 import { createOperationGuard, createStateStore } from "../src/state.js"
 import { createRootCache } from "../src/sdk.js"
-import { createTranscriptQueue } from "../src/transcript.js"
+import { createTranscriptPager } from "../src/transcript.js"
 import { createHistoricalTools, type StmServices } from "../src/tools.js"
 import type { MutableMessage, MutablePart } from "../src/injection.js"
 import { fakeClient, headerResponse, type FakeHandler } from "./fakes.js"
 
 const DEFAULT_TITLE = "New session - 2026-10-10T00:00:00.000Z"
-const STM_SENTINEL = "STM_TRANSCRIPT_SENTINEL_7777"
-// Invented ack chunk ids for fixture tool results only; never a real session id.
-const OLD_CHUNK_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+const BEGIN_MARKER = "----- BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
+const END_MARKER = "----- END OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
+const ESCAPED_BEGIN = "-----\\ BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
+const ESCAPED_END = "-----\\ END OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
 
 const createdDirs: string[] = []
 
@@ -50,22 +51,67 @@ function toolContext(messageID = "msg_tool"): any {
   }
 }
 
-async function execute(tools: Record<string, any>, name: string, args: unknown, ctx: any) {
-  return JSON.parse(String(await tools[name]!.execute(args, ctx)))
+function headerOf(output: string): Record<string, any> {
+  const first = output.split("\n")[0]
+  assert.ok(first !== undefined && first.length > 0, "output has a header line")
+  return JSON.parse(first)
 }
 
-function ackOutput(ack: Record<string, unknown>): string {
-  return JSON.stringify(ack)
+// Single-pass inverse of the documented escape: escape tokens first, then
+// doubled backslashes.
+function decodeEscaped(text: string): string {
+  let decoded = ""
+  let index = 0
+  while (index < text.length) {
+    if (text.startsWith(ESCAPED_BEGIN, index)) {
+      decoded += BEGIN_MARKER
+      index += ESCAPED_BEGIN.length
+      continue
+    }
+    if (text.startsWith(ESCAPED_END, index)) {
+      decoded += END_MARKER
+      index += ESCAPED_END.length
+      continue
+    }
+    const char = text[index]!
+    if (char === "\\") {
+      assert.equal(text[index + 1], "\\", "the escaped payload doubles every literal backslash")
+      decoded += "\\"
+      index += 2
+      continue
+    }
+    decoded += char
+    index += 1
+  }
+  return decoded
 }
 
-function transcriptToolPart(ack: Record<string, unknown>, overrides: Record<string, unknown> = {}): MutablePart {
+function framePayload(output: string): string {
+  const lines = output.split("\n")
+  const begin = lines.indexOf(BEGIN_MARKER)
+  const end = lines.lastIndexOf(END_MARKER)
+  assert.ok(begin >= 0 && end > begin, "output carries one well-formed frame")
+  return decodeEscaped(lines.slice(begin + 5, end).join("\n"))
+}
+
+function transcriptPart(id: string, callID: string, output: string): MutablePart {
   return {
-    id: "tool-transcript",
+    id,
     type: "tool",
     tool: "stm_history_transcript",
-    callID: "call-transcript-1",
-    state: { status: "completed", output: ackOutput(ack), ...overrides },
+    callID,
+    state: { status: "completed", output },
   } as MutablePart
+}
+
+function requestWith(output1: string, output2: string): MutableMessage[] {
+  return [
+    user("m1"),
+    { info: { id: "call-1-msg", sessionID: "ses_1", role: "assistant" }, parts: [transcriptPart("part-1", "call-1", output1)] },
+    user("m2"),
+    { info: { id: "call-2-msg", sessionID: "ses_1", role: "assistant" }, parts: [transcriptPart("part-2", "call-2", output2)] },
+    user("m3"),
+  ]
 }
 
 function makeServices(handlers: { get?: FakeHandler; update?: FakeHandler; messages?: FakeHandler } = {}) {
@@ -79,7 +125,7 @@ function makeServices(handlers: { get?: FakeHandler; update?: FakeHandler; messa
     client,
     config: DEFAULT_CONFIG,
     state: createStateStore({ stateDir }),
-    queue: createTranscriptQueue(),
+    transcripts: createTranscriptPager(),
     roots: createRootCache(client),
     guard: createOperationGuard(),
     blocked: new Map(),
@@ -94,11 +140,11 @@ function readState(stateDir: string): any {
   return JSON.parse(readFileSync(join(stateDir, name), "utf8"))
 }
 
-async function transcriptServices() {
+async function transcriptServices(source: string) {
   const { services, stateDir } = makeServices({
     messages: async () => ({
-      data: [{ info: { id: "h1", sessionID: "ses_hist", role: "user" }, parts: [{ type: "text", text: STM_SENTINEL }] }],
-      response: { headers: { get: () => null } },
+      data: [{ info: { id: "h1", sessionID: "ses_hist", role: "user" }, parts: [{ type: "text", text: source }] }],
+      response: headerResponse("x-next-cursor", null),
     }),
   })
   const tools = createHistoricalTools({
@@ -108,207 +154,98 @@ async function transcriptServices() {
   return { services, stateDir, tools }
 }
 
-// Queue a chunk and return the ack the tool returned to the model: the same
-// JSON the outgoing array carries as the transcript tool result.
-async function queueChunk(services: StmServices, tools: Record<string, any>, messageID = "msg_tool") {
-  const ack = await execute(tools, "stm_history_transcript", { sessionID: "ses_hist" }, toolContext(messageID))
-  assert.equal(ack.status, "ok")
-  assert.equal(typeof ack.chunkID, "string")
-  return ack as Record<string, unknown>
+async function fetchChunk(tools: Record<string, any>, cursor?: string): Promise<string> {
+  const args = cursor === undefined ? { sessionID: "ses_hist" } : { sessionID: "ses_hist", cursor }
+  return String(await tools.stm_history_transcript!.execute(args as any, toolContext()))
 }
 
-test("transcript delivery relocates the queued chunk into the matching completed tool result", async () => {
-  const { services, stateDir, tools } = await transcriptServices()
-  const ack = await queueChunk(services, tools)
-  const toolPart = transcriptToolPart(ack)
-  assert.equal(String((toolPart.state as { output?: unknown }).output).includes(STM_SENTINEL), false, "the ack never carries text")
+// Collect two direct outputs for the source: the first bounded slice and the
+// continuation that exhausts the page.
+async function collectTwo(tools: Record<string, any>, source: string): Promise<[string, string]> {
+  const first = await fetchChunk(tools)
+  const firstHeader = headerOf(first)
+  assert.equal(firstHeader.complete, false, "the fixture needs at least two chunks")
+  const second = await fetchChunk(tools, firstHeader.cursor ?? undefined)
+  assert.equal(headerOf(second).complete, true)
+  assert.equal(framePayload(first) + framePayload(second), source)
+  assert.notEqual(framePayload(first), framePayload(second))
+  return [first, second]
+}
 
-  const messages: MutableMessage[] = [
-    user("m1"),
-    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [toolPart] },
-  ]
+test("stored direct results survive cloned requests with an intervening message", async () => {
+  const source = `head-${"a".repeat(20000)}-tail`
+  const { services, stateDir, tools } = await transcriptServices(source)
+  const [first, second] = await collectTwo(tools, source)
+
+  // The host reconstructs a fresh outgoing request from stored parts: clone the
+  // stored outputs into new message objects and run the transform over them.
+  const messages = requestWith(first, second)
+  const before = JSON.stringify(messages)
   await createTransform(services)({}, { messages } as any)
 
-  const output = String((toolPart.state as { output?: unknown }).output)
-  // The ack stays byte-identical at the head; the framed chunk is appended.
-  assert.ok(output.startsWith(ackOutput(ack)), "the ack prefix is intact")
-  assert.match(output, /BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT \(UNTRUSTED\)/)
-  assert.match(output, /STM_TRANSCRIPT_SENTINEL_7777/)
-  assert.match(output, /END OPENCODE-STM HISTORICAL TRANSCRIPT \(UNTRUSTED\)/)
-  assert.ok(output.includes("\n\n"), "the chunk is separated from the ack by a blank line")
-  // No synthetic assistant transcript part exists: the tool result is the only carrier.
+  const partOne = messages[1]!.parts[0]! as MutablePart & { state: { output: string } }
+  const partTwo = messages[3]!.parts[0]! as MutablePart & { state: { output: string } }
+  assert.equal(partOne.state.output, first, "the earlier result is byte-identical after the transform")
+  assert.equal(partTwo.state.output, second, "the later result is byte-identical after the transform")
+  assert.equal(JSON.stringify(messages), before, "the transform does not rewrite the stored array")
+
+  // Both chunks remain available without any STM replay injection and contain
+  // distinct source slices.
+  assert.equal(framePayload(partOne.state.output) + framePayload(partTwo.state.output), source)
+  assert.notEqual(framePayload(partOne.state.output), framePayload(partTwo.state.output))
   assert.equal(messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-")).length, 0)
-  // The canonical call id and part identity survive conversion-ready delivery.
-  assert.equal(toolPart.callID, "call-transcript-1")
-  assert.equal(messages[1]?.parts[0], toolPart)
-  assert.equal(messages.length, 2)
-  // Consumed exactly once; the stored state never sees the transcript text.
-  assert.equal(services.queue.take("ses_1", 0), null)
-  assert.equal(JSON.stringify(readState(stateDir)).includes(STM_SENTINEL), false)
+  assert.equal(JSON.stringify(readState(stateDir)).includes(source.slice(0, 40)), false, "no raw text reaches state")
 })
 
-test("delivery matches the ack chunk id and never misroutes across tool results", async () => {
-  const { services, tools } = await transcriptServices()
-  const ack = await queueChunk(services, tools)
+test("review end never modifies already stored direct results", async () => {
+  const source = `head-${"b".repeat(20000)}-tail`
+  const { services, tools } = await transcriptServices(source)
+  const [first, second] = await collectTwo(tools, source)
 
-  const oldAck = { ...ack, chunkID: OLD_CHUNK_ID }
-  const bashPart: MutablePart = { id: "tool-bash", type: "tool", tool: "bash", callID: "call-bash-1", state: { status: "completed", output: "bash output" } }
-  const oldPart = transcriptToolPart(oldAck)
-  const currentPart = transcriptToolPart(ack)
-
-  const messages: MutableMessage[] = [
-    user("m1"),
-    {
-      info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" },
-      parts: [bashPart, oldPart, currentPart],
-    },
-  ]
-  await createTransform(services)({}, { messages } as any)
-
-  // Only the result whose ack carries the pending chunk id receives the frame.
-  assert.equal(String((bashPart.state as { output?: unknown }).output), "bash output")
-  assert.equal(String((oldPart.state as { output?: unknown }).output), ackOutput(oldAck))
-  const currentOutput = String((currentPart.state as { output?: unknown }).output)
-  assert.match(currentOutput, /STM_TRANSCRIPT_SENTINEL_7777/)
-  assert.equal(services.queue.take("ses_1", 0), null, "delivered exactly once")
-})
-
-test("an unfinished or non-correlating tool result leaves the chunk queued", async () => {
-  const { services, tools } = await transcriptServices()
-  const ack = await queueChunk(services, tools)
-
-  // An unfinished result must not receive the frame and must not consume it.
-  const runningPart = transcriptToolPart(ack, { status: "running", output: null })
-  let messages: MutableMessage[] = [
-    user("m1"),
-    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [runningPart] },
-  ]
-  await createTransform(services)({}, { messages } as any)
-  assert.equal(String((runningPart.state as { output?: unknown }).output), "null")
-  assert.notEqual(services.queue.take("ses_1", 0), null, "the chunk is retained, not consumed")
-  // take() above was only the retention probe; re-queue by consuming the probe result
-  services.queue.endReview("ses_1", "ses_hist")
-
-  // An ack output without the correlation id (for example truncated by a host)
-  // also fails to match and retains the chunk.
-  const ack2 = await queueChunk(services, tools)
-  delete ack2.chunkID
-  const noCorrelationPart = transcriptToolPart(ack2)
-  messages = [
-    user("m1"),
-    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [noCorrelationPart] },
-  ]
-  await createTransform(services)({}, { messages } as any)
-  assert.equal(String((noCorrelationPart.state as { output?: unknown }).output), ackOutput(ack2))
-  assert.notEqual(services.queue.take("ses_1", 0), null, "the chunk is still retained, not consumed")
-  services.queue.endReview("ses_1", "ses_hist")
-})
-
-test("delivery appends after host-appended markers in the ack output", async () => {
-  const { services, tools } = await transcriptServices()
-  const ack = await queueChunk(services, tools)
-  // A capturing host may append markers to the output string before the
-  // transform runs; the chunk-id correlation must still match the result.
-  const toolPart = transcriptToolPart(ack)
-  const marked = `${ackOutput(ack)}\n[capture-marker] wrapped`
-  ;(toolPart.state as { output?: unknown }).output = marked
-
-  const messages: MutableMessage[] = [
-    user("m1"),
-    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [toolPart] },
-  ]
-  await createTransform(services)({}, { messages } as any)
-
-  const output = String((toolPart.state as { output?: unknown }).output)
-  assert.ok(output.startsWith(marked), "the marked ack stays intact at the head")
-  assert.match(output, /STM_TRANSCRIPT_SENTINEL_7777/)
-  assert.equal(services.queue.take("ses_1", 0), null)
-
-  // Idempotence behind a marker: a replayed transform appends no second frame.
-  await createTransform(services)({}, { messages } as any)
-  assert.equal(String((toolPart.state as { output?: unknown }).output), output)
-})
-
-test("a foreign-target ack carrying the chunk id in appended text does not misroute or consume", async () => {
-  const { services, tools } = await transcriptServices()
-  const ack = await queueChunk(services, tools)
-  // A completed transcript result of a DIFFERENT target whose captured output
-  // embeds the pending chunk id: only the parsed ack object may correlate.
-  const foreignPart = transcriptToolPart({
-    ...ack,
-    sessionID: "ses_other",
-    chunkID: OLD_CHUNK_ID,
-  })
-  ;(foreignPart.state as { output?: unknown }).output = `${String((foreignPart.state as { output?: unknown }).output)}\nCaptured echo of chunk ${String(ack.chunkID)} while reviewing another target`
-
-  const messages: MutableMessage[] = [
-    user("m1"),
-    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [foreignPart] },
-  ]
-  await createTransform(services)({}, { messages } as any)
-
-  assert.equal(
-    String((foreignPart.state as { output?: unknown }).output).includes(STM_SENTINEL),
-    false,
-    "the foreign-target result never receives the frame",
+  const reviewed = JSON.parse(
+    String(
+      await tools.stm_history_review_end!.execute(
+        { sessionID: "ses_hist", outcome: "reviewed" },
+        toolContext("msg_end"),
+      ),
+    ),
   )
-  assert.notEqual(services.queue.take("ses_1", 0), null, "the chunk is retained, not consumed")
+  assert.equal(reviewed.status, "ok")
+  assert.equal(services.transcripts.has("ses_1"), false, "the pagination binding is discarded")
+
+  const messages = requestWith(first, second)
+  await createTransform(services)({}, { messages } as any)
+  assert.equal(String((messages[1]!.parts[0] as MutablePart & { state: { output: string } }).state.output), first)
+  assert.equal(String((messages[3]!.parts[0] as MutablePart & { state: { output: string } }).state.output), second)
+  assert.equal(framePayload(first) + framePayload(second), source)
 })
 
-test("a malformed ack output does not consume the chunk", async () => {
-  const { services, tools } = await transcriptServices()
-  const ack = await queueChunk(services, tools)
-  // The ack JSON is no longer the leading object: fail closed.
-  const toolPart = transcriptToolPart(ack)
-  ;(toolPart.state as { output?: unknown }).output = `host prefix ${ackOutput(ack)}`
+test("a sensitive review end cannot retract stored direct results", async () => {
+  const source = `head-${"c".repeat(20000)}-tail`
+  const { services, tools } = await transcriptServices(source)
+  const [first, second] = await collectTwo(tools, source)
 
-  const messages: MutableMessage[] = [
-    user("m1"),
-    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [toolPart] },
-  ]
+  const ended = JSON.parse(
+    String(
+      await tools.stm_history_review_end!.execute(
+        { sessionID: "ses_hist", outcome: "sensitive" },
+        toolContext("msg_end"),
+      ),
+    ),
+  )
+  assert.equal(ended.status, "ok")
+
+  const messages = requestWith(first, second)
+  const before = JSON.stringify(messages)
   await createTransform(services)({}, { messages } as any)
-
-  assert.equal(String((toolPart.state as { output?: unknown }).output).includes(STM_SENTINEL), false)
-  assert.notEqual(services.queue.take("ses_1", 0), null, "the chunk is retained, not consumed")
+  assert.equal(JSON.stringify(messages), before, "a sensitive end does not alter past results")
+  assert.equal(framePayload(first) + framePayload(second), source)
 })
 
-test("duplicate matching acks fail closed and retain the queue", async () => {
-  const { services, tools } = await transcriptServices()
-  const ack = await queueChunk(services, tools)
-  // Two identical completed acks cannot be disambiguated: neither is written.
-  const firstPart = transcriptToolPart(ack)
-  const secondPart = transcriptToolPart(ack)
-
-  const messages: MutableMessage[] = [
-    user("m1"),
-    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [firstPart, secondPart] },
-  ]
+test("the transform ignores unrelated stored tool results", async () => {
+  const { services } = makeServices()
+  const messages = requestWith("result one", "result two")
+  const before = JSON.stringify(messages)
   await createTransform(services)({}, { messages } as any)
-
-  assert.equal(String((firstPart.state as { output?: unknown }).output), ackOutput(ack))
-  assert.equal(String((secondPart.state as { output?: unknown }).output), ackOutput(ack))
-  assert.notEqual(services.queue.take("ses_1", 0), null, "the chunk is retained, not consumed")
-})
-
-test("a missing anchor message retains the pending chunk for a later transform", async () => {
-  const { services, tools } = await transcriptServices()
-  await queueChunk(services, tools, "msg_gone")
-
-  const messages: MutableMessage[] = [user("m1")]
-  await createTransform(services)({}, { messages } as any)
-  assert.equal(messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-")).length, 0)
-  // The failed attempt did not consume the chunk: it is retained.
-  assert.notEqual(services.queue.take("ses_1", 0), null)
-  services.queue.endReview("ses_1", "ses_hist")
-
-  // A later review can still queue and deliver through a matching result.
-  const { services: services2, tools: tools2 } = await transcriptServices()
-  const ack = await queueChunk(services2, tools2, "msg_tool")
-  const toolPart = transcriptToolPart(ack)
-  const later: MutableMessage[] = [
-    user("m1"),
-    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [toolPart] },
-  ]
-  await createTransform(services2)({}, { messages: later } as any)
-  assert.match(String((toolPart.state as { output?: unknown }).output), /STM_TRANSCRIPT_SENTINEL_7777/)
+  assert.equal(JSON.stringify(messages), before)
 })

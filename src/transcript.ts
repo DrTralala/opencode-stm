@@ -1,9 +1,13 @@
 import { createHash, randomUUID } from "node:crypto"
 import type { PageMessage } from "./sdk.js"
+import { chunkText } from "./injection.js"
 
 export const CHUNK_BYTES = 16 * 1024
-export const QUEUE_TTL_MS = 60_000
-export const QUEUE_MAX_CALLERS = 16
+export const CHUNK_LINES = 1999
+export const PAGER_MAX_CALLERS = 16
+// Constant, bounded refusal when the metadata/framing envelope cannot fit with
+// any source progress. The message never echoes the oversized value.
+export const ENVELOPE_BUDGET_REASON = "pager: output envelope cannot fit the continuation budget"
 
 export type TextEntry = { messageID: string; text: string }
 
@@ -36,49 +40,9 @@ export function splitUtf8(text: string, maxBytes: number = CHUNK_BYTES): { chunk
   return { chunk: encoded.subarray(0, end).toString("utf8"), rest: encoded.subarray(end).toString("utf8") }
 }
 
-export type PendingChunk = {
-  id: string
-  callerSessionID: string
-  targetSessionID: string
-  requestMessageID: string
-  text: string
-  cursorLabel: string | null
-  page: number
-  complete: boolean
-  createdAt: number
-  expiresAt: number
-}
-
-type CallerState = {
-  targetSessionID: string
-  requestMessageID: string
-  // Opaque generation token for the fetch currently owning this binding. Every
-  // successful begin rotates it; supply and release must present it.
-  requestToken: string
-  pageCursor: string | undefined
-  entryIndex: number
-  byteOffset: number
-  pageExhausted: boolean
-  nextPageCursor: string | null
-  issuedCursor: string | null
-  complete: boolean
-  page: number
-  pageDigest: string | null
-  pending: PendingChunk | null
-  // Set when an expiry is observed on this binding. The expired chunk's raw text
-  // is unrecoverable, so the stored offsets and cursors would silently skip the
-  // lost content: begins are rejected until the caller explicitly ends the
-  // review, and the restart refetches from the first page.
-  expired: boolean
-  signal?: AbortSignal
-  abortListener?: () => void
-  updatedAt: number
-}
-
 export type BeginInput = {
   callerSessionID: string
   targetSessionID: string
-  requestMessageID: string
   cursor?: string
   signal?: AbortSignal
 }
@@ -87,42 +51,16 @@ export type BeginResult =
   | { ok: true; token: string; fetchCursor: string | undefined }
   | { ok: false; reason: string }
 
-export type QueueAck = {
-  targetSessionID: string
-  messages: number
-  bytes: number
-  cursor: string | null
-  more: boolean
-  complete: boolean
-  continuation: boolean
-  // Correlation id of the queued chunk: a random UUID, never raw text. The
-  // tool ack surfaces it so the outgoing transform can attach the framed
-  // chunk to the exact tool result that queued it.
-  chunkID: string | null
-}
+export type SupplyPage = { entries: TextEntry[]; nextCursor: string | null }
 
-export type SupplyResult = { ok: true; ack: QueueAck } | { ok: false; reason: string }
-
-export type HandoffResult = { ok: true } | { ok: false; reason: string }
+export type SupplyResult = { ok: true; output: string } | { ok: false; reason: string }
 
 export type EndReviewResult = { ok: true } | { ok: false; reason: string }
 
-export interface TranscriptQueue {
-  begin(input: BeginInput, now: number): BeginResult
-  supply(
-    callerSessionID: string,
-    page: { entries: TextEntry[]; nextCursor: string | null },
-    now: number,
-    token: string,
-  ): SupplyResult
-  take(callerSessionID: string, now: number): PendingChunk | null
-  // Peek the pending chunk without consuming it; expiry is observed lazily.
-  // The delivery contract is peek → attach → take with no await in between, so
-  // no other queue access can interleave; a chunk that cannot be attached
-  // stays queued until an eligible transform or the lazy expiry.
-  peek(callerSessionID: string, now: number): PendingChunk | null
+export interface TranscriptPager {
+  begin(input: BeginInput): BeginResult
+  supply(callerSessionID: string, page: SupplyPage, token: string): SupplyResult
   release(callerSessionID: string, token: string): boolean
-  handoff(callerSessionID: string, token: string): HandoffResult
   endReview(callerSessionID: string, targetSessionID: string): EndReviewResult
   discardCaller(callerSessionID: string): void
   has(callerSessionID: string): boolean
@@ -130,41 +68,169 @@ export interface TranscriptQueue {
   dispose(): void
 }
 
-export function createTranscriptQueue(options: { ttlMs?: number; maxCallers?: number } = {}): TranscriptQueue {
-  const ttlMs = options.ttlMs ?? QUEUE_TTL_MS
+// A page switch requested by an exhausted page's issued cursor. It is only
+// committed when a supply succeeds, so a failed read or an envelope refusal
+// rolls back to the page and cursor issued by the last successful result.
+type PendingAdvance = { cursor: string; page: number }
+
+type CallerState = {
+  targetSessionID: string
+  // Opaque generation token for the fetch currently owning this binding. Every
+  // begin rotates it; supply and release must present it.
+  requestToken: string
+  // True while a fetch owns the binding. A second begin must not race offsets.
+  active: boolean
+  // Committed cursor that produced the current page; undefined is the newest page.
+  pageCursor: string | undefined
+  // Bytes of the current page's newline-joined entry stream already delivered.
+  // A single code-point-aligned offset is enough because the page is refetched
+  // whole on every continuation.
+  pageOffset: number
+  complete: boolean
+  // Cursor issued with the last exhausted page, or null while a page is partial.
+  issuedCursor: string | null
+  page: number
+  // Page fingerprint retained only while a page is partially consumed, so a
+  // mutated page fails closed instead of silently skipping content.
+  pageDigest: string | null
+  // Page switch owned by the active fetch, or null. Never committed until the
+  // fetch supplies successfully.
+  pending: PendingAdvance | null
+  signal?: AbortSignal
+  abortListener?: () => void
+}
+
+// Tagged and length-prefixed so no cursor value (including the literal "end")
+// can collide with the null cursor marker, and adjacent fields cannot alias.
+function digestPage(page: SupplyPage): string {
+  const hash = createHash("sha256")
+  hash.update("stm-page-v1;")
+  for (const entry of page.entries) {
+    const idBytes = Buffer.from(entry.messageID, "utf8")
+    const textBytes = Buffer.from(entry.text, "utf8")
+    hash.update(`id:${idBytes.byteLength}:`)
+    hash.update(idBytes)
+    hash.update(`;text:${textBytes.byteLength}:`)
+    hash.update(textBytes)
+    hash.update(";")
+  }
+  hash.update(`cursor:${JSON.stringify(page.nextCursor)}`)
+  return hash.digest("hex")
+}
+
+// The page source stream is the visible entries joined by a single newline.
+// Offsets always land on code-point boundaries and separators are part of the
+// stream, so concatenating delivered slices reproduces it byte-for-byte.
+type PageStream = { joined: Buffer; starts: number[]; lengths: number[] }
+
+function buildPageStream(entries: TextEntry[]): PageStream {
+  const buffers = entries.map((entry) => Buffer.from(entry.text, "utf8"))
+  const lengths = buffers.map((buffer) => buffer.byteLength)
+  const starts: number[] = []
+  let total = 0
+  for (let index = 0; index < buffers.length; index += 1) {
+    starts.push(total)
+    total += lengths[index]!
+    if (index + 1 < buffers.length) total += 1
+  }
+  const joined = Buffer.allocUnsafe(total)
+  let at = 0
+  for (let index = 0; index < buffers.length; index += 1) {
+    buffers[index]!.copy(joined, at)
+    at += lengths[index]!
+    if (index + 1 < buffers.length) {
+      joined[at] = 0x0a
+      at += 1
+    }
+  }
+  return { joined, starts, lengths }
+}
+
+// Entries completed by this result: the chunk that contains an entry's final
+// byte counts it, so every entry is counted exactly once across a partition of
+// the page stream. An entry ending exactly at the boundary belongs to the
+// earlier chunk.
+function countCompletedEntries(stream: PageStream, start: number, end: number): number {
+  let count = 0
+  for (let index = 0; index < stream.starts.length; index += 1) {
+    const entryEnd = stream.starts[index]! + stream.lengths[index]!
+    if (entryEnd > start && entryEnd <= end) count += 1
+  }
+  return count
+}
+
+function countNewlines(buffer: Buffer): number {
+  let count = 0
+  for (const byte of buffer) {
+    if (byte === 0x0a) count += 1
+  }
+  return count
+}
+
+// Largest code-point boundary at or below `offset`, so a cut never splits a
+// multi-byte code point.
+function snapDown(buffer: Buffer, offset: number): number {
+  let end = Math.min(offset, buffer.byteLength)
+  while (end > 0 && (buffer[end]! & 0b1100_0000) === 0b1000_0000) end -= 1
+  return end
+}
+
+function continuationGuidance(cursor: string | null, complete: boolean): string {
+  if (complete) return "End of history for this target: stop calling stm_history_transcript."
+  if (cursor !== null) return "More history remains: call stm_history_transcript again with this cursor."
+  return "More of this page remains: call stm_history_transcript again without a cursor."
+}
+
+type OutputInput = {
+  targetSessionID: string
+  page: number
+  cursorLabel: string | null
+  messages: number
+  bytes: number
+  cursor: string | null
+  complete: boolean
+  text: string
+}
+
+// One JSON metadata header line, a blank line, then the framed untrusted text.
+// Metadata, separators, framing and marker escaping all consume the budget.
+function formatOutput(input: OutputInput): string {
+  const header = JSON.stringify({
+    plugin: "opencode-stm",
+    status: "ok",
+    sessionID: input.targetSessionID,
+    page: input.page,
+    messages: input.messages,
+    bytes: input.bytes,
+    cursor: input.cursor,
+    more: !input.complete,
+    complete: input.complete,
+    continuation: continuationGuidance(input.cursor, input.complete),
+  })
+  const frame = chunkText({
+    targetSessionID: input.targetSessionID,
+    cursorLabel: input.cursorLabel,
+    page: input.page,
+    text: input.text,
+    complete: input.complete,
+  })
+  return `${header}\n\n${frame}`
+}
+
+function transcriptOutputFits(output: string): boolean {
+  return Buffer.byteLength(output, "utf8") <= CHUNK_BYTES && output.split("\n").length <= CHUNK_LINES
+}
+
+export function createTranscriptPager(options: { maxCallers?: number } = {}): TranscriptPager {
   // A caller-tunable capacity may only lower the hard cap: valid positive integers
-  // above QUEUE_MAX_CALLERS are clamped, any other value fails closed with a
+  // above PAGER_MAX_CALLERS are clamped, any other value fails closed with a
   // deterministic error instead of silently disabling the cap.
   const requested = options.maxCallers
   if (requested !== undefined && (!Number.isInteger(requested) || requested < 1)) {
     throw new RangeError("maxCallers must be a positive integer")
   }
-  const maxCallers = requested === undefined ? QUEUE_MAX_CALLERS : Math.min(requested, QUEUE_MAX_CALLERS)
+  const maxCallers = requested === undefined ? PAGER_MAX_CALLERS : Math.min(requested, PAGER_MAX_CALLERS)
   const states = new Map<string, CallerState>()
-
-  // Expiry is an eligibility deadline, not a real-time erase: an expired chunk may
-  // stay in RAM until the next queue operation. Every begin sweeps all callers so
-  // unused buffers are released without any timer or background wakeup.
-  function purgeExpired(state: CallerState | undefined, now: number): void {
-    if (state !== undefined && state.pending !== null && now >= state.pending.expiresAt) {
-      state.pending = null
-      detachAbort(state)
-      // Observed expiry ends the fetch attempt: a late duplicate supply must use a
-      // fresh begin instead of resurrecting the expired request.
-      state.requestToken = randomUUID()
-      // Fail closed: the undelivered chunk cannot be recovered, so the advanced
-      // entryIndex/byteOffset/cursor must never be resumed — a continuation would
-      // silently skip the lost content. Mark the binding expired and refuse
-      // begins until an explicit endReview; only then can the caller restart the
-      // review and refetch from the first page.
-      state.expired = true
-    }
-  }
-
-  // Observed expiry releases both raw content and the listener on its signal.
-  function purgeExpiredAll(now: number): void {
-    for (const state of states.values()) purgeExpired(state, now)
-  }
 
   function detachAbort(state: CallerState): void {
     if (state.signal !== undefined && state.abortListener !== undefined) {
@@ -183,9 +249,9 @@ export function createTranscriptQueue(options: { ttlMs?: number; maxCallers?: nu
     const listener = () => {
       const live = states.get(callerSessionID)
       if (live !== undefined) {
-        live.pending = null
         detachAbort(live)
-        // Invalidate the request binding too: a late fetch cannot supply it.
+        // An in-flight abort invalidates the binding: offsets from a fetch that
+        // was cancelled are never trusted, so the next review restarts.
         states.delete(callerSessionID)
       }
     }
@@ -194,252 +260,198 @@ export function createTranscriptQueue(options: { ttlMs?: number; maxCallers?: nu
     signal.addEventListener("abort", listener, { once: true })
   }
 
-  // Tagged and length-prefixed so no cursor value (including the literal "end")
-  // can collide with the null cursor marker, and adjacent fields cannot alias.
-  function digestPage(page: { entries: TextEntry[]; nextCursor: string | null }): string {
-    const hash = createHash("sha256")
-    hash.update("stm-page-v1;")
-    for (const entry of page.entries) {
-      const idBytes = Buffer.from(entry.messageID, "utf8")
-      const textBytes = Buffer.from(entry.text, "utf8")
-      hash.update(`id:${idBytes.byteLength}:`)
-      hash.update(idBytes)
-      hash.update(`;text:${textBytes.byteLength}:`)
-      hash.update(textBytes)
-      hash.update(";")
-    }
-    hash.update(`cursor:${JSON.stringify(page.nextCursor)}`)
-    return hash.digest("hex")
+  // End the fetch attempt, release its listener and make its token stale. An
+  // uncommitted page switch is discarded: the issued cursor and committed page
+  // remain retryable exactly as the last successful result left them.
+  function releaseFetch(state: CallerState): void {
+    detachAbort(state)
+    state.active = false
+    state.pending = null
+    state.requestToken = randomUUID()
   }
 
   return {
-    begin(input, now) {
-      purgeExpiredAll(now)
+    begin(input) {
       if (input.signal !== undefined && input.signal.aborted) {
-        return { ok: false, reason: "queue: aborted" }
+        return { ok: false, reason: "pager: aborted" }
       }
       const state = states.get(input.callerSessionID)
-      if (state !== undefined && state.pending !== null) {
-        return { ok: false, reason: "queue: chunk pending delivery" }
-      }
-      if (state !== undefined && state.expired) {
-        return { ok: false, reason: "queue: chunk expired; end the review and restart" }
-      }
-      if (state !== undefined && state.targetSessionID !== input.targetSessionID) {
-        return { ok: false, reason: "queue: target binding mismatch; end review first" }
-      }
       if (state === undefined) {
-        if (input.cursor !== undefined) return { ok: false, reason: "queue: unknown cursor" }
-        if (states.size >= maxCallers) return { ok: false, reason: "queue: too many callers" }
+        if (input.cursor !== undefined) return { ok: false, reason: "pager: unknown cursor" }
+        if (states.size >= maxCallers) return { ok: false, reason: "pager: too many callers" }
         const created: CallerState = {
           targetSessionID: input.targetSessionID,
-          requestMessageID: input.requestMessageID,
           requestToken: randomUUID(),
+          active: true,
           pageCursor: undefined,
-          entryIndex: 0,
-          byteOffset: 0,
-          pageExhausted: false,
-          nextPageCursor: null,
-          issuedCursor: null,
+          pageOffset: 0,
           complete: false,
+          issuedCursor: null,
           page: 1,
           pageDigest: null,
           pending: null,
-          expired: false,
-          updatedAt: now,
         }
         states.set(input.callerSessionID, created)
         setRequestSignal(input.callerSessionID, created, input.signal)
         return { ok: true, token: created.requestToken, fetchCursor: undefined }
       }
-      if (state.complete) return { ok: false, reason: "queue: end of history" }
+      if (state.targetSessionID !== input.targetSessionID) {
+        return { ok: false, reason: "pager: target binding mismatch; end review first" }
+      }
+      if (state.active) return { ok: false, reason: "pager: fetch in progress" }
+      if (state.complete) return { ok: false, reason: "pager: end of history" }
       const normalized = input.cursor ?? null
       if (normalized !== state.issuedCursor) {
-        return { ok: false, reason: "queue: cursor not issued to this caller/target" }
+        return { ok: false, reason: "pager: cursor not issued to this caller/target" }
+      }
+      let fetchCursor = state.pageCursor
+      if (input.cursor !== undefined) {
+        // The exhausted page issued this cursor: select the next page but do
+        // not consume the cursor or advance the committed page yet. A failed
+        // read or a refusal must leave the same cursor retryable; only a
+        // successful supply commits the switch.
+        state.pending = { cursor: input.cursor, page: state.page + 1 }
+        fetchCursor = input.cursor
       }
       setRequestSignal(input.callerSessionID, state, input.signal)
-      // A new fetch owns the binding from here: the previous token is stale.
       state.requestToken = randomUUID()
-      if (input.cursor !== undefined && state.pageExhausted) {
-        state.pageCursor = input.cursor
-        state.entryIndex = 0
-        state.byteOffset = 0
-        state.pageExhausted = false
-        state.nextPageCursor = null
-        state.page += 1
-        state.pageDigest = null
-        state.requestMessageID = input.requestMessageID
-        state.updatedAt = now
-        return { ok: true, token: state.requestToken, fetchCursor: input.cursor }
-      }
-      state.requestMessageID = input.requestMessageID
-      state.updatedAt = now
-      return { ok: true, token: state.requestToken, fetchCursor: state.pageCursor }
+      state.active = true
+      return { ok: true, token: state.requestToken, fetchCursor }
     },
 
-    supply(callerSessionID, page, now, token) {
+    supply(callerSessionID, page, token) {
       const state = states.get(callerSessionID)
-      if (state === undefined) return { ok: false, reason: "queue: not started" }
-      purgeExpired(state, now)
-      if (token !== state.requestToken) {
-        // A response from a superseded, released, delivered, expired or aborted
-        // fetch must never enter the current binding.
-        return { ok: false, reason: "queue: stale request" }
+      if (state === undefined) return { ok: false, reason: "pager: not started" }
+      if (token !== state.requestToken || !state.active) {
+        // A response from a superseded, released, ended or aborted fetch must
+        // never enter the current binding.
+        return { ok: false, reason: "pager: stale request" }
       }
       if (state.signal !== undefined && state.signal.aborted) {
-        // An aborted call must never queue text, even if the caller forgot to check.
-        state.pending = null
-        detachAbort(state)
-        return { ok: false, reason: "queue: aborted" }
-      }
-      if (state.pending !== null) return { ok: false, reason: "queue: chunk pending delivery" }
-
-      const digest = digestPage(page)
-      const resumingPartially = state.entryIndex > 0 || state.byteOffset > 0
-      if (resumingPartially && state.pageDigest !== null && digest !== state.pageDigest) {
-        // The page changed under the stored offsets (new messages or edited text).
-        // Fail closed, drop the caller binding and require an explicit restart with
-        // no cursor; never guess, skip or mislabel content.
+        // Defensive: the listener normally removes the state synchronously.
         detachAbort(state)
         states.delete(callerSessionID)
-        return { ok: false, reason: "queue: page changed; restart the transcript review" }
+        return { ok: false, reason: "pager: aborted" }
       }
 
-      let index = state.entryIndex
-      let offset = state.byteOffset
-      let bytes = 0
-      let messages = 0
-      const pieces: string[] = []
-
-      while (index < page.entries.length) {
-        const entry = page.entries[index]!
-        const encoded = Buffer.from(entry.text, "utf8")
-        const remaining = encoded.subarray(Math.min(offset, encoded.byteLength))
-        if (remaining.byteLength === 0) {
-          offset = 0
-          index += 1
-          continue
-        }
-        const separator = pieces.length === 0 ? "" : "\n"
-        const separatorBytes = Buffer.byteLength(separator, "utf8")
-        const available = CHUNK_BYTES - bytes - separatorBytes
-        if (available <= 0) break
-        const cut = safeCut(remaining, available)
-        if (cut === 0) break
-        pieces.push(separator + remaining.subarray(0, cut).toString("utf8"))
-        bytes += separatorBytes + cut
-        offset += cut
-        if (offset < encoded.byteLength) break
-        index += 1
-        offset = 0
-        messages += 1
-      }
-
-      if (index >= page.entries.length) {
-        state.entryIndex = index
-        state.byteOffset = 0
-        if (page.nextCursor !== null) {
-          state.pageExhausted = true
-          state.nextPageCursor = page.nextCursor
-          state.issuedCursor = page.nextCursor
-        } else {
-          state.complete = true
-          state.issuedCursor = null
-        }
-      } else {
-        state.entryIndex = index
-        state.byteOffset = offset
-        state.issuedCursor = null
-      }
-      // Retain only the digest, never raw page text. A partially consumed page keeps
-      // its digest so the next same-page continuation can detect mutation; an
-      // exhausted page clears it because the next page gets its own digest.
-      state.pageDigest = index >= page.entries.length ? null : digest
-      state.updatedAt = now
-
-      const text = pieces.join("")
-      let chunkID: string | null = null
-      if (text.length > 0) {
-        const pending: PendingChunk = {
-          id: randomUUID(),
-          callerSessionID,
-          targetSessionID: state.targetSessionID,
-          requestMessageID: state.requestMessageID,
-          text,
-          cursorLabel: state.pageCursor ?? null,
-          page: state.page,
-          complete: state.complete,
-          createdAt: now,
-          expiresAt: now + ttlMs,
-        }
-        state.pending = pending
-        chunkID = pending.id
-      } else {
-        // A successful fetch with no visible text has no pending payload to
-        // protect: consume the generation exactly like take() so a duplicate
-        // supply with the same token fails closed instead of replaying offsets.
-        detachAbort(state)
-        state.requestToken = randomUUID()
-      }
-      return {
-        ok: true,
-        ack: {
-          targetSessionID: state.targetSessionID,
-          messages,
-          bytes,
-          cursor: state.issuedCursor,
-          more: !state.complete,
-          complete: state.complete,
-          continuation: text.length > 0,
-          chunkID,
-        },
-      }
-    },
-
-    take(callerSessionID, now) {
-      const state = states.get(callerSessionID)
-      if (state === undefined) return null
-      purgeExpired(state, now)
+      const digest = digestPage(page)
       const pending = state.pending
-      if (pending === null) return null
-      state.pending = null
-      detachAbort(state)
-      // Delivery ends the fetch attempt: a duplicate late supply cannot inject twice.
-      state.requestToken = randomUUID()
-      return pending
-    },
+      if (pending === null && state.pageOffset > 0 && state.pageDigest !== null && digest !== state.pageDigest) {
+        // The page changed under the stored offsets (new messages or edited
+        // text). Fail closed, drop the binding and require an explicit restart
+        // with no cursor; never guess, skip or mislabel content.
+        detachAbort(state)
+        states.delete(callerSessionID)
+        return { ok: false, reason: "pager: page changed; restart the transcript review" }
+      }
 
-    peek(callerSessionID, now) {
-      const state = states.get(callerSessionID)
-      if (state === undefined) return null
-      purgeExpired(state, now)
-      return state.pending
+      const stream = buildPageStream(page.entries)
+      const pageLength = stream.joined.byteLength
+      // A pending page switch is owned by this fetch: render the new page from
+      // its start while the committed metadata stays untouched.
+      const effectivePage = pending === null ? state.page : pending.page
+      const effectivePageCursor = pending === null ? state.pageCursor : pending.cursor
+      const start = pending === null ? Math.min(state.pageOffset, pageLength) : 0
+      const remainingLength = pageLength - start
+      const cursorLabel = effectivePageCursor ?? null
+
+      const renderPartial = (endOffset: number): string =>
+        formatOutput({
+          targetSessionID: state.targetSessionID,
+          page: effectivePage,
+          cursorLabel,
+          messages: countCompletedEntries(stream, start, endOffset),
+          bytes: endOffset - start,
+          cursor: null,
+          complete: false,
+          text: stream.joined.subarray(start, endOffset).toString("utf8"),
+        })
+
+      // Commit only after a candidate has been rendered and verified to fit; a
+      // pending page switch commits here too, and offsets never advance on a
+      // refusal (releaseFetch discards the pending switch).
+      const settle = (output: string, endOffset: number, exhausted: boolean): SupplyResult => {
+        if (state.pending !== null) {
+          state.pageCursor = state.pending.cursor
+          state.page = state.pending.page
+          state.pageOffset = 0
+          state.pending = null
+        }
+        if (exhausted) {
+          state.pageOffset = 0
+          state.complete = page.nextCursor === null
+          state.issuedCursor = page.nextCursor
+          state.pageDigest = null
+        } else {
+          state.pageOffset = endOffset
+          state.complete = false
+          state.issuedCursor = null
+          state.pageDigest = digest
+        }
+        releaseFetch(state)
+        return { ok: true, output }
+      }
+
+      // Candidate 1: finish the remaining page with its true completion/cursor
+      // metadata. The pre-checks bound the render: source bytes and newlines are
+      // lower bounds of the final output, so over-budget pages are never
+      // rendered in full.
+      if (remainingLength <= CHUNK_BYTES && countNewlines(stream.joined.subarray(start)) <= CHUNK_LINES) {
+        const output = formatOutput({
+          targetSessionID: state.targetSessionID,
+          page: effectivePage,
+          cursorLabel,
+          messages: countCompletedEntries(stream, start, pageLength),
+          bytes: remainingLength,
+          cursor: page.nextCursor,
+          complete: page.nextCursor === null,
+          text: stream.joined.subarray(start, pageLength).toString("utf8"),
+        })
+        if (transcriptOutputFits(output)) return settle(output, pageLength, true)
+      }
+
+      // Candidate 2: the largest code-point-aligned prefix with partial
+      // metadata, strictly shorter than the remaining page so the "more of this
+      // page remains" guidance stays accurate. Binary search is monotone: the
+      // rendered output only grows as the prefix grows.
+      if (remainingLength > 0) {
+        const pageEndBoundary = snapDown(stream.joined, pageLength - 1)
+        const high = Math.min(start + CHUNK_BYTES, pageEndBoundary) - start
+        if (high > 0) {
+          const endFor = (count: number): number => snapDown(stream.joined, start + count)
+          const fitsAt = (count: number): boolean => transcriptOutputFits(renderPartial(endFor(count)))
+          if (fitsAt(0)) {
+            let lo = 0
+            let hi = high
+            if (fitsAt(hi)) {
+              lo = hi
+            } else {
+              while (lo < hi) {
+                const mid = Math.floor((lo + hi + 1) / 2)
+                if (fitsAt(mid)) lo = mid
+                else hi = mid - 1
+              }
+            }
+            const end = endFor(lo)
+            if (end > start) return settle(renderPartial(end), end, false)
+          }
+        }
+      }
+
+      // The envelope cannot fit with any source progress: return a constant
+      // bounded refusal without advancing offsets. The fetch is released so a
+      // later begin can retry the same page.
+      releaseFetch(state)
+      return { ok: false, reason: ENVELOPE_BUDGET_REASON }
     },
 
     release(callerSessionID, token) {
       const state = states.get(callerSessionID)
-      if (state === undefined || state.requestToken !== token) return false
-      state.pending = null
-      detachAbort(state)
-      // The fetch attempt is over: late duplicate supplies are stale.
-      state.requestToken = randomUUID()
+      if (state === undefined || token !== state.requestToken || !state.active) return false
+      // Offsets are deliberately untouched: a failed page read is retryable
+      // with a fresh begin, and a successful commit already rotated the token.
+      releaseFetch(state)
       return true
-    },
-
-    handoff(callerSessionID, token) {
-      const state = states.get(callerSessionID)
-      if (state === undefined) return { ok: false, reason: "queue: not started" }
-      if (token !== state.requestToken) return { ok: false, reason: "queue: stale request" }
-      if (state.pending === null) return { ok: false, reason: "queue: no pending chunk" }
-      // Commit a successful supply: OpenCode 1.18.35 aborts the per-tool signal
-      // after every successful tool return, so detaching the listener here keeps
-      // the queued chunk and cursor binding for the next transform. Aborts before
-      // this handoff still discard via the listener or release(); afterwards
-      // cleanup is take/endReview/discardCaller/dispose or the 60 s lazy sweep.
-      // A true session cancellation after success is indistinguishable from the
-      // host teardown: the chunk is RAM-only, TTL-bounded and never persisted.
-      detachAbort(state)
-      return { ok: true }
     },
 
     endReview(callerSessionID, targetSessionID) {
@@ -448,7 +460,7 @@ export function createTranscriptQueue(options: { ttlMs?: number; maxCallers?: nu
       // a mismatched request must not discard another target's binding.
       if (state === undefined) return { ok: true }
       if (state.targetSessionID !== targetSessionID) {
-        return { ok: false, reason: "queue: review target mismatch" }
+        return { ok: false, reason: "pager: review target mismatch" }
       }
       detachAbort(state)
       states.delete(callerSessionID)

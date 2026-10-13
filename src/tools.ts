@@ -3,7 +3,7 @@ import { tool, type ToolContext, type ToolDefinition } from "@opencode-ai/plugin
 import type { StmConfig } from "./config.js"
 import { initialMeta, hashTitle, type SessionMeta, type StateStore, type OperationGuard } from "./state.js"
 import { page, readSession, writeTitle, type Client, type RootCache } from "./sdk.js"
-import { extractVisibleText, type TranscriptQueue } from "./transcript.js"
+import { ENVELOPE_BUDGET_REASON, extractVisibleText, type SupplyResult, type TranscriptPager } from "./transcript.js"
 import { firstObservation, isDefaultTitle, lockExternal, lockManually, resolveReview, unlock } from "./scheduler.js"
 
 export const TITLE_MAX_CODE_POINTS = 120
@@ -24,7 +24,7 @@ export type StmServices = {
   client: Client
   config: StmConfig
   state: StateStore
-  queue: TranscriptQueue
+  transcripts: TranscriptPager
   roots: RootCache
   guard: OperationGuard
   blocked: Map<string, Set<string>>
@@ -457,7 +457,7 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
   if (services.config.historical.readTranscript) {
     tools.stm_history_transcript = tool({
       description:
-        "Opt-in bounded historical text chunk queued for a later outgoing request. Returns counts and cursors only, never text. A queued ack is only a queue acknowledgement, not evidence that the text was delivered to or reviewed by any model: the framed transcript arrives in a later request's transcript tool result, and if that framed block is absent from your context, do not draw conclusions or rename based on it.",
+        "Opt-in retrieval of one bounded chunk of another root session's visible user/assistant text, returned directly in this tool result and persisted with the session like any other result. Each result is at most 16 KiB and 1999 lines and carries page, cursor, completion and continuation metadata. Follow the continuation guidance: call again without a cursor for more of the same page, with the returned cursor for the next page, or stop when complete. Never returns reasoning or tool bodies.",
       args: { sessionID: tool.schema.string(), cursor: tool.schema.optional(tool.schema.string()) },
       async execute(args, context) {
         if (context.abort.aborted) return status({ status: "aborted" })
@@ -483,86 +483,65 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
         }
         if (target.value.parentID !== undefined) return status({ status: "conflict", reason: "child-target" })
 
-        const begun = services.queue.begin(
-          {
-            callerSessionID: context.sessionID,
-            targetSessionID: args.sessionID,
-            requestMessageID: context.messageID,
-            signal: context.abort,
-            ...(args.cursor === undefined ? {} : { cursor: args.cursor }),
-          },
-          services.now(),
-        )
+        const begun = services.transcripts.begin({
+          callerSessionID: context.sessionID,
+          targetSessionID: args.sessionID,
+          signal: context.abort,
+          ...(args.cursor === undefined ? {} : { cursor: args.cursor }),
+        })
         if (!begun.ok) {
-          return begun.reason === "queue: aborted"
+          return begun.reason === "pager: aborted"
             ? status({ status: "aborted" })
             : status({ status: "conflict", reason: begun.reason })
         }
 
         const fetched = await page(services.client, args.sessionID, begun.fetchCursor, context.abort)
+        // A failed or aborted read releases its fetch generation and leaves the
+        // pager offsets retryable; the release is token-scoped.
         if (context.abort.aborted) {
-          // The abort listener has already dropped any pending chunk; release again
-          // is idempotent. Do not queue text from an aborted call. The token scopes
-          // the release to this fetch generation.
-          services.queue.release(context.sessionID, begun.token)
+          services.transcripts.release(context.sessionID, begun.token)
           return status({ status: "aborted" })
         }
-        if (!fetched.ok) return status({ status: "error" })
-
-        if (context.abort.aborted) {
-          services.queue.release(context.sessionID, begun.token)
-          return status({ status: "aborted" })
+        if (!fetched.ok) {
+          services.transcripts.release(context.sessionID, begun.token)
+          return status({ status: "error" })
         }
         // A sensitive review end may have completed during the fetch: discard the
-        // fetched text instead of queueing it, scoped to this fetch generation.
+        // fetched text instead of returning it, scoped to this fetch generation.
         if (isBlocked(services, context.sessionID, args.sessionID)) {
-          services.queue.release(context.sessionID, begun.token)
+          services.transcripts.release(context.sessionID, begun.token)
           return status({ status: "conflict", reason: "sensitive-blocked" })
         }
-        const supplied = services.queue.supply(
-          context.sessionID,
-          { entries: extractVisibleText(fetched.value.items), nextCursor: fetched.value.nextCursor },
-          services.now(),
-          begun.token,
-        )
+
+        // A malformed page must not wedge the binding: release the fetch
+        // generation before letting the unexpected error surface.
+        let supplied: SupplyResult
+        try {
+          supplied = services.transcripts.supply(
+            context.sessionID,
+            { entries: extractVisibleText(fetched.value.items), nextCursor: fetched.value.nextCursor },
+            begun.token,
+          )
+        } catch (error) {
+          services.transcripts.release(context.sessionID, begun.token)
+          throw error
+        }
         if (!supplied.ok) {
-          return supplied.reason === "queue: aborted"
-            ? status({ status: "aborted" })
-            : status({ status: "conflict", reason: supplied.reason })
+          if (supplied.reason === "pager: aborted") return status({ status: "aborted" })
+          if (supplied.reason === ENVELOPE_BUDGET_REASON) return status({ status: "error", reason: supplied.reason })
+          return status({ status: "conflict", reason: supplied.reason })
         }
-        if (context.abort.aborted) {
-          // An abort that landed before the handoff is a real in-flight
-          // cancellation: the listener (or this release) discards the chunk.
-          services.queue.release(context.sessionID, begun.token)
-          return status({ status: "aborted" })
-        }
-        if (supplied.ack.continuation) {
-          // Commit the queued chunk before returning: OpenCode 1.18.35 aborts the
-          // per-tool signal after every successful return, and the handoff detaches
-          // that listener so the next transform can still take the chunk.
-          const handed = services.queue.handoff(context.sessionID, begun.token)
-          if (!handed.ok) return status({ status: "conflict", reason: handed.reason })
-        }
-        return status({
-          status: "ok",
-          sessionID: args.sessionID,
-          messages: supplied.ack.messages,
-          bytes: supplied.ack.bytes,
-          cursor: supplied.ack.cursor,
-          more: supplied.ack.more,
-          complete: supplied.ack.complete,
-          continuation: supplied.ack.continuation,
-          // Correlation id for the outgoing delivery (a random UUID, never
-          // text): the transform matches it inside this ack to attach the
-          // framed chunk to exactly this tool result.
-          chunkID: supplied.ack.chunkID,
-        })
+        // A successful synchronous supply committed the offsets and detached the
+        // request abort listener before returning, so the text is part of this
+        // result and the host's post-success signal teardown cannot cancel the
+        // next continuation.
+        return supplied.output
       },
     })
 
     tools.stm_history_review_end = tool({
       description:
-        "Discard queued transcript content and end this caller's review of a target. A sensitive outcome blocks further transcript reads and renames of that target.",
+        "End this caller's review of a target and discard STM's pagination state. A sensitive outcome blocks further transcript reads and renames of that target. Previously returned transcript results remain in session history and are not erased.",
       args: { sessionID: tool.schema.string(), outcome: tool.schema.enum(["reviewed", "sensitive", "cancelled"]) },
       async execute(args, context) {
         if (context.abort.aborted) return status({ status: "aborted" })
@@ -573,7 +552,7 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
           outcome: args.outcome,
         })
         if (!approved.ok) return status({ status: approved.status })
-        const ended = services.queue.endReview(context.sessionID, args.sessionID)
+        const ended = services.transcripts.endReview(context.sessionID, args.sessionID)
         if (!ended.ok) return status({ status: "conflict", reason: ended.reason })
         if (args.outcome === "sensitive") blockTarget(services, context.sessionID, args.sessionID)
         return status({ status: "ok", outcome: args.outcome })

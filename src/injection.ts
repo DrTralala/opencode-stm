@@ -1,7 +1,8 @@
-// Deterministic outgoing-array injection primitives: single-session checks and
-// in-place reminder-anchor / transcript-chunk insertion. Callers mutate the
-// existing output.messages array and its parts; neither is ever replaced, and
-// existing parts (including tool-call/result parts) keep their position.
+// Deterministic outgoing-array injection primitives: single-session checks,
+// in-place reminder-anchor insertion and untrusted historical-text framing.
+// Callers mutate the existing output.messages array and its parts; neither is
+// ever replaced, and existing parts (including tool-call/result parts) keep
+// their position.
 
 import type { AnchorState } from "./state.js"
 
@@ -96,16 +97,44 @@ export type ChunkTextInput = {
 const TRANSCRIPT_BEGIN_MARKER = "----- BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
 const TRANSCRIPT_END_MARKER = "----- END OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
 
-// A payload may itself contain a literal outer marker. Rewrite every occurrence
-// so it cannot reproduce the frame line and close the untrusted block early.
-// This preserves the payload readably and deterministically; it is a framing
-// integrity measure, not a defence against model prompt injection.
+// Reversible payload escaping. Single pass, in this order:
+// - a source occurrence of a frame marker becomes a token with one backslash
+//   inserted after the leading dashes, so no raw marker line can appear;
+// - every literal backslash is doubled.
+// Neither token equals a raw marker or the other token, and doubling means a
+// source that itself contains an escape token ("-----\\ BEGIN ...") encodes to
+// "-----\\\\ BEGIN ..." and decodes back unchanged. The inverse pass (tokens
+// first, then doubled backslashes) recovers the source exactly, including a
+// chunk cut that lands inside a marker. Escaping only grows output, so the
+// prefix budget search stays monotone. This is framing integrity, not a
+// defence against model prompt injection.
+const ESCAPED_TRANSCRIPT_BEGIN = "-----\\ BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
+const ESCAPED_TRANSCRIPT_END = "-----\\ END OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
+
 function escapeTranscriptMarkers(text: string): string {
-  return text
-    .split(TRANSCRIPT_BEGIN_MARKER)
-    .join("----- [ESCAPED] BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----")
-    .split(TRANSCRIPT_END_MARKER)
-    .join("----- [ESCAPED] END OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----")
+  let escaped = ""
+  let index = 0
+  while (index < text.length) {
+    if (text.startsWith(TRANSCRIPT_BEGIN_MARKER, index)) {
+      escaped += ESCAPED_TRANSCRIPT_BEGIN
+      index += TRANSCRIPT_BEGIN_MARKER.length
+      continue
+    }
+    if (text.startsWith(TRANSCRIPT_END_MARKER, index)) {
+      escaped += ESCAPED_TRANSCRIPT_END
+      index += TRANSCRIPT_END_MARKER.length
+      continue
+    }
+    const char = text[index]!
+    if (char === "\\") {
+      escaped += "\\\\"
+      index += 1
+      continue
+    }
+    escaped += char
+    index += 1
+  }
+  return escaped
 }
 
 export function chunkText(input: ChunkTextInput): string {
@@ -121,110 +150,4 @@ export function chunkText(input: ChunkTextInput): string {
     escapeTranscriptMarkers(input.text),
     TRANSCRIPT_END_MARKER,
   ].join("\n")
-}
-
-export type ChunkAttachInput = {
-  messageID: string
-  // Correlation id from the tool ack (safe metadata: a random UUID, never text).
-  chunkID: string
-  // The framed chunk text produced by chunkText.
-  text: string
-  // Target session of the queued chunk (from the pending chunk): the ack must
-  // name the same target, so a foreign-target result can never be matched.
-  targetSessionID: string
-}
-
-export type ChunkAttachResult = "attached" | "anchor-missing" | "result-missing" | "ambiguous"
-
-type ToolResultState = { status?: unknown; output?: unknown }
-
-function toolResultOutput(state: ToolResultState): string {
-  return typeof state.output === "string" ? state.output : JSON.stringify(state.output ?? "")
-}
-
-// Parse the leading JSON object of an ack output, tolerating trailing content
-// (host-appended markers, previously delivered framed text). The scan is
-// string-aware: braces, escapes and quotes inside string values never close
-// the object early. Any non-object, malformed object or non-JSON prefix fails
-// closed with null.
-function leadingAckObject(output: string): Record<string, unknown> | null {
-  let start = 0
-  while (start < output.length && /\s/.test(output[start]!)) start += 1
-  if (output[start] !== "{") return null
-  let depth = 0
-  let inString = false
-  let escaped = false
-  for (let index = start; index < output.length; index += 1) {
-    const char = output[index]!
-    if (inString) {
-      if (escaped) escaped = false
-      else if (char === "\\") escaped = true
-      else if (char === '"') inString = false
-      continue
-    }
-    if (char === '"') inString = true
-    else if (char === "{") depth += 1
-    else if (char === "}") {
-      depth -= 1
-      if (depth === 0) {
-        try {
-          const parsed: unknown = JSON.parse(output.slice(start, index + 1))
-          if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null
-          return parsed as Record<string, unknown>
-        } catch {
-          return null
-        }
-      }
-    }
-  }
-  return null
-}
-
-// Exact ack correlation: the parsed object must be this plugin's successful
-// transcript ack for this exact chunk and target. The chunk id appearing
-// anywhere else in the output (appended text, other fields) never matches.
-function matchesAck(ack: Record<string, unknown>, input: ChunkAttachInput): boolean {
-  return ack.plugin === "opencode-stm" && ack.status === "ok" && ack.chunkID === input.chunkID && ack.sessionID === input.targetSessionID
-}
-
-// Outbound-only transcript delivery: the framed chunk is appended to the
-// matching completed stm_history_transcript tool result so it rides the same
-// wire item as every other tool result (function_call_output) instead of a
-// synthetic assistant part, whose interleaving a Responses endpoint may drop.
-// The match parses the result's leading ack JSON and requires the exact
-// plugin/status/chunkID/sessionID quadruple — never a substring search, tool
-// position or an untyped call id — so a host that appends markers to the
-// output string, several tool results in one message, an older ack for the
-// same target, or a chunk id embedded in unrelated output cannot misroute the
-// payload. When several results match exactly the same ack, the delivery fails
-// closed instead of guessing. Existing parts keep their position and identity;
-// the ack stays byte-identical at the head; the stored tool result is never
-// touched (the outgoing array is rebuilt from storage). The caller guarantees
-// the array is single-session and the message is located by the pending
-// chunk's requestMessageID.
-export function attachChunkToToolResult(
-  messages: MutableMessage[],
-  input: ChunkAttachInput,
-): ChunkAttachResult {
-  const message = findMessage(messages, input.messageID)
-  if (message === undefined) return "anchor-missing"
-  const matches: Array<MutablePart & { state: ToolResultState }> = []
-  for (const part of message.parts) {
-    if (part.type !== "tool" || part.tool !== "stm_history_transcript") continue
-    const state = part.state as ToolResultState | undefined
-    if (state === undefined || state.status !== "completed") continue
-    const ack = leadingAckObject(toolResultOutput(state))
-    if (ack === null || !matchesAck(ack, input)) continue
-    matches.push(part as MutablePart & { state: ToolResultState })
-  }
-  if (matches.length === 0) return "result-missing"
-  // Ambiguity fails closed: the chunk is retained rather than attached to a
-  // guessed first match.
-  if (matches.length > 1) return "ambiguous"
-  const result = matches[0]!
-  const original = toolResultOutput(result.state)
-  // A replayed delivery must never duplicate the frame.
-  if (original.includes(input.text)) return "attached"
-  result.state.output = original.length > 0 ? `${original}\n\n${input.text}` : input.text
-  return "attached"
 }

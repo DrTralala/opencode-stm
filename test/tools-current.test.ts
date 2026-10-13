@@ -8,7 +8,7 @@ import type { ToolContext } from "@opencode-ai/plugin"
 import { DEFAULT_CONFIG } from "../src/config.js"
 import { hashSessionID, hashTitle, initialMeta, createStateStore, createOperationGuard } from "../src/state.js"
 import { createRootCache } from "../src/sdk.js"
-import { createTranscriptQueue } from "../src/transcript.js"
+import { createTranscriptPager } from "../src/transcript.js"
 import { resolveReview, unlock } from "../src/scheduler.js"
 import { createCurrentTools, establishBaseline, validateTitle, type StmServices } from "../src/tools.js"
 import { fakeClient, type FakeHandler } from "./fakes.js"
@@ -59,7 +59,7 @@ function makeServices(handlers: { get?: FakeHandler; update?: FakeHandler } = {}
     client,
     config: DEFAULT_CONFIG,
     state: createStateStore({ stateDir: dir }),
-    queue: createTranscriptQueue(),
+    transcripts: createTranscriptPager(),
     roots: createRootCache(client),
     guard: createOperationGuard(),
     blocked: new Map(),

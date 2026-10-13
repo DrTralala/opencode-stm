@@ -8,11 +8,15 @@ import type { ToolContext } from "@opencode-ai/plugin"
 import { DEFAULT_CONFIG, type StmConfig } from "../src/config.js"
 import { createOperationGuard, createStateStore, hashSessionID, hashTitle, initialMeta } from "../src/state.js"
 import { createRootCache } from "../src/sdk.js"
-import { createTranscriptQueue } from "../src/transcript.js"
+import { createTranscriptPager, ENVELOPE_BUDGET_REASON } from "../src/transcript.js"
 import { createHistoricalTools, type StmServices } from "../src/tools.js"
 import { fakeClient, headerResponse, type FakeHandler } from "./fakes.js"
 
 const TRANSCRIPT_SENTINEL = "STM_TRANSCRIPT_SENTINEL_4321"
+const BEGIN_MARKER = "----- BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
+const END_MARKER = "----- END OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
+const ESCAPED_BEGIN = "-----\\ BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
+const ESCAPED_END = "-----\\ END OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
 
 const createdDirs: string[] = []
 
@@ -56,7 +60,7 @@ function makeServices(
     client,
     config,
     state: createStateStore({ stateDir: dir }),
-    queue: createTranscriptQueue(),
+    transcripts: createTranscriptPager(),
     roots: createRootCache(client),
     guard: createOperationGuard(),
     blocked: new Map(),
@@ -73,10 +77,68 @@ async function execute(tools: Record<string, any>, name: string, args: unknown, 
   return JSON.parse(String(await tools[name]!.execute(args as any, ctx)))
 }
 
+async function executeRaw(tools: Record<string, any>, name: string, args: unknown, ctx: ToolContext): Promise<string> {
+  return String(await tools[name]!.execute(args as any, ctx))
+}
+
+function headerOf(output: string): Record<string, any> {
+  const first = output.split("\n")[0]
+  assert.ok(first !== undefined && first.length > 0, "output has a header line")
+  return JSON.parse(first)
+}
+
+// Single-pass inverse of the documented escape: escape tokens first, then
+// doubled backslashes.
+function decodeEscaped(text: string): string {
+  let decoded = ""
+  let index = 0
+  while (index < text.length) {
+    if (text.startsWith(ESCAPED_BEGIN, index)) {
+      decoded += BEGIN_MARKER
+      index += ESCAPED_BEGIN.length
+      continue
+    }
+    if (text.startsWith(ESCAPED_END, index)) {
+      decoded += END_MARKER
+      index += ESCAPED_END.length
+      continue
+    }
+    const char = text[index]!
+    if (char === "\\") {
+      assert.equal(text[index + 1], "\\", "the escaped payload doubles every literal backslash")
+      decoded += "\\"
+      index += 2
+      continue
+    }
+    decoded += char
+    index += 1
+  }
+  return decoded
+}
+
+// Recover the exact source slice of one output.
+function framePayload(output: string): string {
+  const lines = output.split("\n")
+  const begin = lines.indexOf(BEGIN_MARKER)
+  const end = lines.lastIndexOf(END_MARKER)
+  assert.ok(begin >= 0 && end > begin, "output carries one well-formed frame")
+  return decodeEscaped(lines.slice(begin + 5, end).join("\n"))
+}
+
+function assertBounded(output: string): void {
+  assert.ok(Buffer.byteLength(output, "utf8") <= 16 * 1024)
+  assert.ok(output.split("\n").length <= 1999)
+}
+
 async function flush(): Promise<void> {
   await new Promise((resolve) => setImmediate(resolve))
   await new Promise((resolve) => setImmediate(resolve))
 }
+
+const sentinelPage = (nextCursor: string | null, text = TRANSCRIPT_SENTINEL) => ({
+  data: [{ info: { id: "m1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text }] }],
+  response: headerResponse("x-next-cursor", nextCursor),
+})
 
 test("historical flags expose exactly their own tools", () => {
   const none = createHistoricalTools(makeServices(DEFAULT_CONFIG).services)
@@ -297,70 +359,144 @@ test("a queued historical rename conflicts when the first rename changes the tit
   assert.equal(calls.filter((call) => call.method === "update").length, 1)
 })
 
-test("transcript acknowledgements carry counts and cursors but never text", async () => {
-  const { services, calls } = makeServices(historicalConfig({ readTranscript: true }), {
-    messages: async () => ({
-      data: [
-        { info: { id: "m1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: TRANSCRIPT_SENTINEL }] },
-      ],
-      response: headerResponse("x-next-cursor", null),
-    }),
+test("transcript returns the framed text directly within both caps", async () => {
+  const { services } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async () => sentinelPage(null),
+  })
+  const tools = createHistoricalTools(services)
+  const output = String(await tools.stm_history_transcript!.execute({ sessionID: "ses_target" }, context()))
+  assert.ok(output.includes(TRANSCRIPT_SENTINEL))
+  assert.ok(Buffer.byteLength(output, "utf8") <= 16 * 1024)
+  assert.ok(output.split("\n").length <= 1999)
+  const header = JSON.parse(output.split("\n")[0]!)
+  assert.equal(header.status, "ok")
+  assert.equal(header.sessionID, "ses_target")
+  assert.equal(header.complete, true)
+  assert.equal(header.cursor, null)
+  assert.equal("chunkID" in header, false)
+  assert.equal(framePayload(output), TRANSCRIPT_SENTINEL)
+  assert.equal(output.split("\n")[1], "")
+  assert.equal(output.split("\n")[2], BEGIN_MARKER)
+})
+
+test("transcript metadata carries counts, cursors and guidance but never text", async () => {
+  const { services } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async () => sentinelPage("cur-1"),
   })
   const tools = createHistoricalTools(services)
   const ctx = context()
-  const result = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, ctx)
-  assert.equal(result.status, "ok")
-  assert.equal(result.bytes > 0, true)
-  assert.equal(result.complete, true)
-  assert.equal(result.cursor, null)
-  assert.deepEqual(Object.keys(result).sort(), [
+  const output = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, ctx)
+  const header = headerOf(output)
+  assert.deepEqual(Object.keys(header).sort(), [
     "bytes",
-    "chunkID",
     "complete",
     "continuation",
     "cursor",
     "messages",
     "more",
+    "page",
     "plugin",
     "sessionID",
     "status",
   ])
-  assert.equal(typeof result.chunkID, "string", "the ack carries the delivery correlation id")
-  assert.equal(JSON.stringify(result).includes(TRANSCRIPT_SENTINEL), false)
+  assert.equal(header.bytes > 0, true)
+  assert.equal(header.messages, 1)
+  assert.equal(header.cursor, "cur-1")
+  assert.equal(header.complete, false)
+  assert.equal(header.more, true)
+  assert.match(header.continuation, /cursor/i)
+  assert.equal(JSON.stringify(header).includes(TRANSCRIPT_SENTINEL), false)
+  assertBounded(output)
   assert.deepEqual(ctx.asks[0].metadata, {})
-  const pageCalls = calls.filter((call) => call.method === "messages")
-  assert.equal(pageCalls.length, 1)
-  assert.deepEqual(pageCalls[0]?.options.query, { limit: 8 })
-
-  // A cursor that was never issued to this caller is rejected before any page fetch.
-  const foreign = await execute(
-    tools,
-    "stm_history_transcript",
-    { sessionID: "ses_target", cursor: "foreign" },
-    context("ses_other"),
-  )
-  assert.equal(foreign.status, "conflict")
-  assert.match(foreign.reason, /cursor/)
-  assert.equal(calls.filter((call) => call.method === "messages").length, 1)
 })
 
-test("the transcript description conveys the ack queue semantics", () => {
+test("transcript pages deliver distinct continuations and stop when complete", async () => {
+  const { services, calls } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async (options: any) =>
+      options.query.before === "cur-1"
+        ? {
+            data: [{ info: { id: "m0", sessionID: "ses_target", role: "assistant" }, parts: [{ type: "text", text: "older page" }] }],
+            response: headerResponse("x-next-cursor", null),
+          }
+        : sentinelPage("cur-1", "newest page"),
+  })
+  const tools = createHistoricalTools(services)
+  const first = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  const firstHeader = headerOf(first)
+  assert.equal(firstHeader.cursor, "cur-1")
+  assert.equal(firstHeader.complete, false)
+  assert.equal(framePayload(first), "newest page")
+
+  const second = await executeRaw(
+    tools,
+    "stm_history_transcript",
+    { sessionID: "ses_target", cursor: "cur-1" },
+    context(),
+  )
+  const secondHeader = headerOf(second)
+  assert.equal(secondHeader.complete, true)
+  assert.equal(secondHeader.page, 2)
+  assert.equal(framePayload(second), "older page")
+  assert.notEqual(framePayload(first), framePayload(second), "distinct continuations")
+
+  const stopped = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  assert.equal(stopped.status, "conflict")
+  assert.match(stopped.reason, /end of history/)
+  assert.equal(calls.filter((call) => call.method === "messages").length, 2)
+})
+
+test("transcript direct results stay bounded across same-page continuations", async () => {
+  const source = "a".repeat(40000)
+  const { services, calls } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async () => sentinelPage(null, source),
+  })
+  const tools = createHistoricalTools(services)
+  const payloads: string[] = []
+  let cursor: string | undefined
+  for (let index = 0; index < 10; index += 1) {
+    const args = cursor === undefined ? { sessionID: "ses_target" } : { sessionID: "ses_target", cursor }
+    const output = await executeRaw(tools, "stm_history_transcript", args, context())
+    assertBounded(output)
+    const header = headerOf(output)
+    payloads.push(framePayload(output))
+    if (header.complete) break
+    cursor = header.cursor ?? undefined
+  }
+  assert.ok(payloads.length >= 3, "40000 bytes need several bounded chunks")
+  assert.equal(payloads.join(""), source)
+  assert.equal(calls.filter((call) => call.method === "messages").length, payloads.length)
+})
+
+test("the transcript description conveys direct persistent results", () => {
   const { services } = makeServices(historicalConfig({ readTranscript: true }))
   const tools = createHistoricalTools(services)
   const description = String(tools.stm_history_transcript?.description ?? "")
-  assert.match(description, /never text/)
-  assert.match(description, /queue acknowledgement|not evidence/i)
-  assert.doesNotMatch(description, /delivery receipt/i)
-  assert.match(description, /later request|later outgoing request/i)
-  assert.match(description, /rename|conclusion/i)
+  assert.match(description, /directly|direct/i)
+  assert.match(description, /persist/i)
+  assert.match(description, /16 KiB/)
+  assert.match(description, /1999/)
+  assert.match(description, /cursor/i)
+  assert.match(description, /stop|complete/i)
+  assert.match(description, /reasoning|tool bodies/i)
+  assert.doesNotMatch(description, /queue acknowledgement|later outgoing request/i)
+})
+
+test("the review end description does not claim stored results are erased", () => {
+  const { services } = makeServices(historicalConfig({ readTranscript: true }))
+  const tools = createHistoricalTools(services)
+  const description = String(tools.stm_history_review_end?.description ?? "")
+  assert.match(description, /previously returned|not erased|remain/i)
+  assert.doesNotMatch(description, /discard queued|queue acknowledgement/i)
 })
 
 test("transcript asks with empty metadata", async () => {
-  const { services } = makeServices(historicalConfig({ readTranscript: true }))
+  const { services } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async () => sentinelPage(null),
+  })
   const tools = createHistoricalTools(services)
   const ctx = context()
-  const result = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, ctx)
-  assert.equal(result.status, "ok")
+  const result = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, ctx)
+  assert.equal(headerOf(result).status, "ok")
   assert.deepEqual(ctx.asks[0], {
     permission: "stm_history_transcript",
     patterns: ["ses_target"],
@@ -385,23 +521,13 @@ test("transcript rejects a child target after permission", async () => {
   assert.equal(calls.filter((call) => call.method === "messages").length, 0)
 })
 
-test("transcript cursor mismatch is a conflict", async () => {
+test("transcript cursor mismatch is a conflict without a refetch", async () => {
   const { services, calls } = makeServices(historicalConfig({ readTranscript: true }), {
-    messages: async () => ({
-      data: [
-        { info: { id: "m1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "partial" }] },
-      ],
-      response: headerResponse("x-next-cursor", "cur-1"),
-    }),
+    messages: async () => sentinelPage("cur-1", "partial"),
   })
   const tools = createHistoricalTools(services)
-  const first = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
-  assert.equal(first.status, "ok")
-  assert.equal(first.cursor, "cur-1")
-  assert.equal(first.complete, false)
-  assert.equal(first.more, true)
-  // Simulate delivery of the pending chunk by the outgoing transform.
-  assert.notEqual(services.queue.take("ses_caller", 0), null)
+  const first = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  assert.equal(headerOf(first).cursor, "cur-1")
   const mismatched = await execute(
     tools,
     "stm_history_transcript",
@@ -413,83 +539,103 @@ test("transcript cursor mismatch is a conflict", async () => {
   assert.equal(calls.filter((call) => call.method === "messages").length, 1)
 })
 
-test("transcript pending chunk blocks a second fetch", async () => {
+test("a failed next-page read retries with the cursor returned by the last result", async () => {
+  let pageTwoAttempts = 0
   const { services, calls } = makeServices(historicalConfig({ readTranscript: true }), {
-    messages: async () => ({
-      data: [
-        { info: { id: "m1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "hold" }] },
-      ],
-      response: headerResponse("x-next-cursor", null),
-    }),
+    messages: async (options: any) => {
+      if (options.query.before === "cur-1") {
+        pageTwoAttempts += 1
+        if (pageTwoAttempts === 1) return { error: { message: "unavailable" } }
+        return {
+          data: [{ info: { id: "m0", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "older page" }] }],
+          response: headerResponse("x-next-cursor", null),
+        }
+      }
+      return sentinelPage("cur-1", "newest page")
+    },
   })
   const tools = createHistoricalTools(services)
-  const first = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
-  assert.equal(first.status, "ok")
+  const first = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  const cursor = headerOf(first).cursor
+  assert.equal(cursor, "cur-1")
+
+  const failed = await execute(tools, "stm_history_transcript", { sessionID: "ses_target", cursor }, context())
+  assert.equal(failed.status, "error")
+
+  // The exact cursor from the last successful result retries the same page and
+  // the page number advances exactly once.
+  const second = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target", cursor }, context())
+  const secondHeader = headerOf(second)
+  assert.equal(secondHeader.status, "ok")
+  assert.equal(secondHeader.page, 2)
+  assert.equal(secondHeader.complete, true)
+  assert.equal(secondHeader.cursor, null)
+  assert.equal(framePayload(second), "older page")
+  assert.equal(pageTwoAttempts, 2)
+  assert.equal(calls.filter((call) => call.method === "messages").length, 3)
+})
+
+test("an overlapping transcript fetch conflicts instead of racing offsets", async () => {
+  let releasePage: (value: unknown) => void = () => {}
+  const deferred = new Promise((resolve) => {
+    releasePage = resolve
+  })
+  const { services, calls } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async () => deferred as any,
+  })
+  const tools = createHistoricalTools(services)
+  const first = executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  await flush()
   const second = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
   assert.equal(second.status, "conflict")
-  assert.equal(second.reason, "queue: chunk pending delivery")
+  assert.match(second.reason, /fetch in progress/)
+  releasePage(sentinelPage(null))
+  const output = await first
+  assert.equal(headerOf(output).status, "ok")
+  assert.equal(framePayload(output), TRANSCRIPT_SENTINEL)
   assert.equal(calls.filter((call) => call.method === "messages").length, 1)
 })
 
-test("transcript chunk survives the host abort after a successful tool return", async () => {
-  const { services } = makeServices(historicalConfig({ readTranscript: true }), {
-    messages: async () => ({
-      data: [
-        { info: { id: "m1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: TRANSCRIPT_SENTINEL }] },
-      ],
-      response: headerResponse("x-next-cursor", "cur-1"),
-    }),
-  })
-  const tools = createHistoricalTools(services)
-  const controller = new AbortController()
-  const result = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context("ses_caller", controller))
-  assert.equal(result.status, "ok")
-  assert.equal(result.cursor, "cur-1")
-  // OpenCode 1.18.35 aborts the per-tool signal after every successful return.
-  controller.abort()
-  const delivered = services.queue.take("ses_caller", 0)
-  assert.notEqual(delivered, null, "the committed chunk survives the host's post-success abort")
-  assert.equal(delivered?.requestMessageID, "msg_tool")
-  assert.equal(services.queue.take("ses_caller", 0), null, "delivery is still one-shot")
-})
-
-test("transcript cursor continuation works after the completed tool signal abort", async () => {
+test("a failed page read releases the fetch and the retry succeeds", async () => {
+  let attempts = 0
   const { services, calls } = makeServices(historicalConfig({ readTranscript: true }), {
-    messages: async (options: any) =>
-      options.query.before === "cur-1"
-        ? {
-            data: [
-              { info: { id: "m0", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "older page" }] },
-            ],
-            response: headerResponse("x-next-cursor", null),
-          }
-        : {
-            data: [
-              { info: { id: "m1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "newest page" }] },
-            ],
-            response: headerResponse("x-next-cursor", "cur-1"),
-          },
+    messages: async () => {
+      attempts += 1
+      if (attempts === 1) return { error: { message: "unavailable" } }
+      return sentinelPage(null)
+    },
   })
   const tools = createHistoricalTools(services)
-  const completed = new AbortController()
-  const first = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context("ses_caller", completed))
-  assert.equal(first.status, "ok")
-  assert.equal(first.cursor, "cur-1")
-  completed.abort()
-  assert.notEqual(services.queue.take("ses_caller", 0), null, "the first chunk is delivered by the transform")
-
-  const second = await execute(
-    tools,
-    "stm_history_transcript",
-    { sessionID: "ses_target", cursor: "cur-1" },
-    context("ses_caller"),
-  )
-  assert.equal(second.status, "ok", `continuation must survive the completed tool signal abort: ${second.reason ?? ""}`)
-  assert.equal(second.complete, true)
-  assert.equal(calls.some((call) => call.method === "messages" && call.options.query.before === "cur-1"), true)
+  const failed = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  assert.equal(failed.status, "error")
+  assert.equal(services.transcripts.has("ses_caller"), true, "the binding is retained for a retry")
+  const retried = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  assert.equal(headerOf(retried).complete, true)
+  assert.equal(framePayload(retried), TRANSCRIPT_SENTINEL)
+  assert.equal(attempts, 2)
+  assert.equal(calls.filter((call) => call.method === "messages").length, 2)
 })
 
-test("abort before and during a deferred fetch never queues text", async () => {
+test("a malformed page releases the fetch instead of wedging the binding", async () => {
+  let attempts = 0
+  const { services } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async () => {
+      attempts += 1
+      if (attempts === 1) return { data: [null], response: headerResponse("x-next-cursor", null) }
+      return sentinelPage(null)
+    },
+  })
+  const tools = createHistoricalTools(services)
+  await assert.rejects(executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context()))
+  // The failed fetch was released: the next call fetches again instead of
+  // conflicting with an abandoned in-flight binding.
+  const retried = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  assert.equal(headerOf(retried).complete, true)
+  assert.equal(framePayload(retried), TRANSCRIPT_SENTINEL)
+  assert.equal(attempts, 2)
+})
+
+test("abort before and during a deferred fetch leaves no binding and no text", async () => {
   let releasePage: (value: unknown) => void = () => {}
   const deferred = new Promise((resolve) => {
     releasePage = resolve
@@ -508,19 +654,70 @@ test("abort before and during a deferred fetch never queues text", async () => {
     context("ses_caller", before),
   )
   assert.equal(beforeResult.status, "aborted")
-  assert.equal(services.queue.size(), 0, "abort before begin creates no caller state")
+  assert.equal(services.transcripts.size(), 0, "abort before begin creates no caller state")
 
   const during = new AbortController()
-  const call = execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context("ses_caller", during))
-  await new Promise((resolve) => setImmediate(resolve))
+  const call = executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context("ses_caller", during))
+  await flush()
+  assert.equal(services.transcripts.has("ses_caller"), true, "the fetch owns the binding")
   during.abort()
-  releasePage({
-    data: [{ info: { id: "m1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "late" }] }],
-    response: headerResponse("x-next-cursor", null),
+  assert.equal(services.transcripts.has("ses_caller"), false, "an in-flight abort invalidates the binding")
+  releasePage(sentinelPage(null, "late"))
+  const after = JSON.parse(await call)
+  assert.equal(after.status, "aborted")
+  assert.equal(services.transcripts.has("ses_caller"), false)
+})
+
+test("transcript continuation survives the completed tool signal abort", async () => {
+  const { services, calls } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async (options: any) =>
+      options.query.before === "cur-1"
+        ? {
+            data: [{ info: { id: "m0", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "older page" }] }],
+            response: headerResponse("x-next-cursor", null),
+          }
+        : sentinelPage("cur-1", "newest page"),
   })
-  const result = await call
-  assert.equal(result.status, "aborted")
-  assert.equal(services.queue.take("ses_caller", 0), null, "no chunk was queued after the abort")
+  const tools = createHistoricalTools(services)
+  const completed = new AbortController()
+  const first = await executeRaw(
+    tools,
+    "stm_history_transcript",
+    { sessionID: "ses_target" },
+    context("ses_caller", completed),
+  )
+  assert.equal(headerOf(first).cursor, "cur-1")
+  // OpenCode 1.18.35 aborts the per-tool signal after every successful return.
+  completed.abort()
+  assert.equal(services.transcripts.has("ses_caller"), true, "the committed binding survives the host abort")
+
+  const second = await executeRaw(
+    tools,
+    "stm_history_transcript",
+    { sessionID: "ses_target", cursor: "cur-1" },
+    context("ses_caller"),
+  )
+  assert.equal(headerOf(second).complete, true)
+  assert.equal(framePayload(second), "older page")
+  assert.equal(calls.some((call) => call.method === "messages" && call.options.query.before === "cur-1"), true)
+})
+
+test("an unrenderable metadata envelope returns a constant bounded error", async () => {
+  const huge = `ses_${"t".repeat(20000)}`
+  const { services, calls } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async () => ({ data: [], response: headerResponse("x-next-cursor", null) }),
+  })
+  const tools = createHistoricalTools(services)
+  const failed = await execute(tools, "stm_history_transcript", { sessionID: huge }, context())
+  assert.equal(failed.status, "error")
+  assert.equal(failed.reason, ENVELOPE_BUDGET_REASON)
+  assert.ok(String(failed.reason).length < 200, "the refusal is constant and bounded")
+
+  // The refusal released the fetch: a retry is not blocked and stays deterministic.
+  const retry = await execute(tools, "stm_history_transcript", { sessionID: huge }, context())
+  assert.equal(retry.status, "error")
+  assert.equal(retry.reason, ENVELOPE_BUDGET_REASON)
+  assert.equal(calls.filter((call) => call.method === "messages").length, 2)
 })
 
 test("self-target rejected for rename, transcript and review end", async () => {
@@ -547,15 +744,19 @@ test("self-target rejected for rename, transcript and review end", async () => {
   assert.equal(calls.length, 0)
 })
 
-test("review end releases buffers; sensitive blocks transcript and rename", async () => {
-  const { services } = makeServices(historicalConfig({ readTranscript: true, renameTitles: true }))
+test("review end releases pagination state; sensitive blocks transcript and rename", async () => {
+  const { services } = makeServices(historicalConfig({ readTranscript: true, renameTitles: true }), {
+    messages: async () => sentinelPage(null),
+  })
   const tools = createHistoricalTools(services)
   const ctx = context()
-  const seeded = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, ctx)
-  assert.equal(seeded.status, "ok")
+  const seeded = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, ctx)
+  assert.equal(headerOf(seeded).status, "ok")
+  assert.equal(framePayload(seeded), TRANSCRIPT_SENTINEL)
+  assert.equal(services.transcripts.has(ctx.sessionID), true, "the completed retrieval keeps its binding")
   const end = await execute(tools, "stm_history_review_end", { sessionID: "ses_target", outcome: "sensitive" }, ctx)
   assert.equal(end.status, "ok")
-  assert.equal(services.queue.has(ctx.sessionID), false)
+  assert.equal(services.transcripts.has(ctx.sessionID), false)
 
   const blockedTranscript = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
   assert.equal(blockedTranscript.status, "conflict")
@@ -572,16 +773,13 @@ test("review end releases buffers; sensitive blocks transcript and rename", asyn
 
 test("review end asks permission; denied or aborted ends nothing", async () => {
   const { services } = makeServices(historicalConfig({ readTranscript: true }), {
-    messages: async () => ({
-      data: [{ info: { id: "m1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "chunk" }] }],
-      response: headerResponse("x-next-cursor", null),
-    }),
+    messages: async () => sentinelPage(null, "chunk"),
   })
   const tools = createHistoricalTools(services)
   const seeded = context()
-  const seededResult = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, seeded)
-  assert.equal(seededResult.status, "ok")
-  assert.equal(services.queue.has("ses_caller"), true)
+  const seededResult = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, seeded)
+  assert.equal(headerOf(seededResult).status, "ok")
+  assert.equal(services.transcripts.has("ses_caller"), true)
 
   const denied = context()
   denied.ask = async (input: any) => {
@@ -601,7 +799,7 @@ test("review end asks permission; denied or aborted ends nothing", async () => {
     always: [],
     metadata: { outcome: "reviewed" },
   })
-  assert.equal(services.queue.has("ses_caller"), true)
+  assert.equal(services.transcripts.has("ses_caller"), true)
 
   const controller = new AbortController()
   controller.abort()
@@ -612,27 +810,25 @@ test("review end asks permission; denied or aborted ends nothing", async () => {
     context("ses_caller", controller),
   )
   assert.equal(abortedEnd.status, "aborted")
-  assert.equal(services.queue.has("ses_caller"), true)
+  assert.equal(services.transcripts.has("ses_caller"), true)
 })
 
 test("review end reviewed and cancelled unblock nothing", async () => {
   for (const outcome of ["reviewed", "cancelled"] as const) {
     const { services } = makeServices(historicalConfig({ readTranscript: true }), {
-      messages: async () => ({
-        data: [{ info: { id: "m1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "chunk" }] }],
-        response: headerResponse("x-next-cursor", null),
-      }),
+      messages: async () => sentinelPage(null, "chunk"),
     })
     const tools = createHistoricalTools(services)
     const ctx = context()
-    const seeded = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, ctx)
-    assert.equal(seeded.status, "ok")
+    // Establish and then complete a binding.
+    await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, ctx)
+    assert.equal(services.transcripts.has(ctx.sessionID), true)
     const end = await execute(tools, "stm_history_review_end", { sessionID: "ses_target", outcome }, ctx)
     assert.equal(end.status, "ok")
-    assert.equal(services.queue.has(ctx.sessionID), false)
+    assert.equal(services.transcripts.has(ctx.sessionID), false)
     assert.equal(services.blocked.get(ctx.sessionID)?.has("ses_target") ?? false, false)
-    const again = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
-    assert.equal(again.status, "ok", `${outcome} must not block the target`)
+    const again = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+    assert.equal(headerOf(again).status, "ok", `${outcome} must not block the target`)
   }
 })
 
@@ -646,20 +842,21 @@ test("sensitive blocks are bound to the caller-target pair and spare title reads
         title = String(options.body.title)
         return { data: { id: options.path.id, title } }
       },
+      messages: async () => sentinelPage(null, "chunk"),
     },
   )
   const tools = createHistoricalTools(services)
   const callerA = context("ses_a")
-  const seeded = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, callerA)
-  assert.equal(seeded.status, "ok")
+  const seeded = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, callerA)
+  assert.equal(headerOf(seeded).status, "ok")
   const end = await execute(tools, "stm_history_review_end", { sessionID: "ses_target", outcome: "sensitive" }, callerA)
   assert.equal(end.status, "ok")
 
   // Title reads remain available, and another caller is not blocked for the same target.
   const read = await execute(tools, "stm_history_title_read", { sessionID: "ses_target" }, callerA)
   assert.equal(read.status, "ok")
-  const otherCaller = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context("ses_b"))
-  assert.equal(otherCaller.status, "ok")
+  const otherCaller = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context("ses_b"))
+  assert.equal(headerOf(otherCaller).status, "ok")
 
   const blocked = await execute(
     tools,
@@ -759,7 +956,7 @@ test("sensitive block landing during the transcript ask stops the fetch", async 
   assert.equal(result.status, "conflict")
   assert.equal(result.reason, "sensitive-blocked")
   assert.equal(calls.filter((entry) => entry.method === "messages").length, 0)
-  assert.equal(services.queue.has("ses_caller"), false)
+  assert.equal(services.transcripts.has("ses_caller"), false)
 })
 
 test("sensitive block landing during the fetch discards the text", async () => {
@@ -773,19 +970,15 @@ test("sensitive block landing during the fetch discards the text", async () => {
   const tools = createHistoricalTools(services)
   const call = execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
   await flush()
-  assert.equal(services.queue.has("ses_caller"), true, "the fetch created the caller binding")
+  assert.equal(services.transcripts.has("ses_caller"), true, "the fetch created the caller binding")
   const end = await execute(tools, "stm_history_review_end", { sessionID: "ses_target", outcome: "sensitive" }, context())
   assert.equal(end.status, "ok")
-  assert.equal(services.queue.has("ses_caller"), false)
-  releasePage({
-    data: [{ info: { id: "m1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "late" }] }],
-    response: headerResponse("x-next-cursor", null),
-  })
+  assert.equal(services.transcripts.has("ses_caller"), false)
+  releasePage(sentinelPage(null, "late"))
   const result = await call
   assert.equal(result.status, "conflict")
   assert.equal(result.reason, "sensitive-blocked")
-  assert.equal(services.queue.take("ses_caller", 0), null, "no text was queued after the sensitive stop")
-  assert.equal(services.queue.has("ses_caller"), false)
+  assert.equal(services.transcripts.has("ses_caller"), false, "no binding survived the sensitive stop")
 })
 
 test("history rename aborted during the write is uncertain without read-back or lock", async () => {
@@ -863,15 +1056,11 @@ test("history rename aborted during the read-back is uncertain without lock", as
 
 test("review end rejects a different target without discarding or blocking", async () => {
   const { services } = makeServices(historicalConfig({ readTranscript: true }), {
-    messages: async () => ({
-      data: [{ info: { id: "m1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "chunk" }] }],
-      response: headerResponse("x-next-cursor", null),
-    }),
+    messages: async () => sentinelPage("cur-1", "chunk"),
   })
   const tools = createHistoricalTools(services)
-  const seeded = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
-  assert.equal(seeded.status, "ok")
-  assert.equal(services.queue.has("ses_caller"), true)
+  await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  assert.equal(services.transcripts.has("ses_caller"), true)
 
   const mismatch = await execute(
     tools,
@@ -881,7 +1070,7 @@ test("review end rejects a different target without discarding or blocking", asy
   )
   assert.equal(mismatch.status, "conflict")
   assert.match(mismatch.reason, /review target mismatch/)
-  assert.equal(services.queue.has("ses_caller"), true, "the active review survives a mismatched end")
+  assert.equal(services.transcripts.has("ses_caller"), true, "the active review survives a mismatched end")
   assert.equal(services.blocked.get("ses_caller")?.has("ses_other") ?? false, false)
 
   const matching = await execute(
@@ -891,7 +1080,7 @@ test("review end rejects a different target without discarding or blocking", asy
     context(),
   )
   assert.equal(matching.status, "ok")
-  assert.equal(services.queue.has("ses_caller"), false)
+  assert.equal(services.transcripts.has("ses_caller"), false)
   const blocked = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
   assert.equal(blocked.status, "conflict")
   assert.equal(blocked.reason, "sensitive-blocked")
@@ -922,13 +1111,13 @@ test("review end recovers a binding lost to abort and still blocks", async () =>
   })
   const tools = createHistoricalTools(services)
   const controller = new AbortController()
-  const call = execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context("ses_caller", controller))
+  const call = executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context("ses_caller", controller))
   await flush()
   controller.abort()
   releasePage({ data: [], response: headerResponse("x-next-cursor", null) })
-  const aborted = await call
+  const aborted = JSON.parse(await call)
   assert.equal(aborted.status, "aborted")
-  assert.equal(services.queue.has("ses_caller"), false)
+  assert.equal(services.transcripts.has("ses_caller"), false)
 
   const end = await execute(
     tools,

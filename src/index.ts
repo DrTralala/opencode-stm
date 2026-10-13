@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import type { Hooks, Plugin, PluginInput, PluginModule, ToolDefinition } from "@opencode-ai/plugin"
 import { loadConfig } from "./config.js"
-import { attachChunkToToolResult, chunkText, ensureAnchorPart, singleSessionMessages, type MutableMessage } from "./injection.js"
+import { ensureAnchorPart, singleSessionMessages, type MutableMessage } from "./injection.js"
 import {
   anchorPartID,
   classifyMessages,
@@ -18,7 +18,7 @@ import {
 } from "./scheduler.js"
 import { createRootCache, readSession } from "./sdk.js"
 import { createOperationGuard, createStateStore, hashTitle, resolveStateDir, type SessionMeta } from "./state.js"
-import { createTranscriptQueue } from "./transcript.js"
+import { createTranscriptPager } from "./transcript.js"
 import { createCurrentTools, createHistoricalTools, type StmServices } from "./tools.js"
 
 export const STM_PLUGIN_ID = "opencode-stm"
@@ -54,35 +54,8 @@ export function createTransform(
     const root = await services.roots.isRoot(sessionID)
     if (!root.ok || !root.value) return
 
-    // One-shot transcript delivery: peek first, then attach the framed chunk to
-    // the matching completed stm_history_transcript tool result and consume it
-    // only when the attachment succeeded. There is no await between peek and
-    // take, so no other queue access can interleave. When the anchor message or
-    // a correlating completed tool result is absent, the chunk stays queued for
-    // a later transform until the lazy 60-second expiry fail-closes the binding.
-    // The chunk rides the tool result (function_call_output) instead of a
-    // synthetic assistant part, whose interleaving a Responses endpoint may
-    // drop. OpenCode 1.18.35 reuses this hook during compaction with no
-    // reliable discriminator, so a queued chunk may still be delivered during a
-    // compaction request; the design accepts this limitation and does not
-    // claim exclusion.
-    const now = services.now()
-    const pending = services.queue.peek(sessionID, now)
-    if (pending !== null) {
-      const attached = attachChunkToToolResult(single.messages, {
-        messageID: pending.requestMessageID,
-        chunkID: pending.id,
-        targetSessionID: pending.targetSessionID,
-        text: chunkText({
-          targetSessionID: pending.targetSessionID,
-          cursorLabel: pending.cursorLabel,
-          page: pending.page,
-          text: pending.text,
-          complete: pending.complete,
-        }),
-      })
-      if (attached === "attached") services.queue.take(sessionID, now)
-    }
+    // Transcript retrieval returns its bounded result directly from the tool
+    // call; the transform only owns title-review reminder injection.
 
     const loaded = await services.state.load(sessionID)
     if (!loaded.ok) return
@@ -183,7 +156,7 @@ export function createEventHook(services: StmServices): NonNullable<Hooks["event
     if (typeof id !== "string" || id.length === 0) return
     await services.state.removeOwned(id)
     services.roots.invalidate(id)
-    services.queue.discardCaller(id)
+    services.transcripts.discardCaller(id)
     services.blocked.delete(id)
     for (const [caller, targets] of services.blocked) {
       if (targets.delete(id) && targets.size === 0) services.blocked.delete(caller)
@@ -208,7 +181,7 @@ export async function createStm(input: PluginInput, runtime: StmRuntime = {}): P
     client: input.client,
     config: loaded.config,
     state: createStateStore({ stateDir: resolveStateDir(env, home), now }),
-    queue: createTranscriptQueue(),
+    transcripts: createTranscriptPager(),
     roots: createRootCache(input.client),
     guard: createOperationGuard(),
     blocked: new Map(),
@@ -225,7 +198,7 @@ export async function createStm(input: PluginInput, runtime: StmRuntime = {}): P
     "experimental.chat.messages.transform": createTransform(services),
     event: createEventHook(services),
     dispose: async () => {
-      services.queue.dispose()
+      services.transcripts.dispose()
       services.roots.clear()
     },
   }
