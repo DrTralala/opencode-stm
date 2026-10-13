@@ -457,7 +457,7 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
   if (services.config.historical.readTranscript) {
     tools.stm_history_transcript = tool({
       description:
-        "Opt-in bounded historical text chunk queued for the next outgoing context. Returns counts and cursors only, never text.",
+        "Opt-in bounded historical text chunk queued for a later outgoing request. Returns counts and cursors only, never text. A queued ack is only a queue acknowledgement, not evidence that the text was delivered to or reviewed by any model: the framed transcript arrives in a later request's transcript tool result, and if that framed block is absent from your context, do not draw conclusions or rename based on it.",
       args: { sessionID: tool.schema.string(), cursor: tool.schema.optional(tool.schema.string()) },
       async execute(args, context) {
         if (context.abort.aborted) return status({ status: "aborted" })
@@ -552,6 +552,10 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
           more: supplied.ack.more,
           complete: supplied.ack.complete,
           continuation: supplied.ack.continuation,
+          // Correlation id for the outgoing delivery (a random UUID, never
+          // text): the transform matches it inside this ack to attach the
+          // framed chunk to exactly this tool result.
+          chunkID: supplied.ack.chunkID,
         })
       },
     })

@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import type { Hooks, Plugin, PluginInput, PluginModule, ToolDefinition } from "@opencode-ai/plugin"
 import { loadConfig } from "./config.js"
-import { chunkText, ensureAnchorPart, ensureChunkPart, singleSessionMessages, type MutableMessage } from "./injection.js"
+import { attachChunkToToolResult, chunkText, ensureAnchorPart, singleSessionMessages, type MutableMessage } from "./injection.js"
 import {
   anchorPartID,
   classifyMessages,
@@ -54,16 +54,25 @@ export function createTransform(
     const root = await services.roots.isRoot(sessionID)
     if (!root.ok || !root.value) return
 
-    // One-shot transcript delivery: attempted on the next eligible transform and
-    // released afterwards. OpenCode 1.18.35 reuses this hook during compaction with
-    // no reliable discriminator, so a queued chunk may be consumed by a compaction
-    // request; the design accepts this limitation and does not claim exclusion.
-    const pending = services.queue.take(sessionID, services.now())
+    // One-shot transcript delivery: peek first, then attach the framed chunk to
+    // the matching completed stm_history_transcript tool result and consume it
+    // only when the attachment succeeded. There is no await between peek and
+    // take, so no other queue access can interleave. When the anchor message or
+    // a correlating completed tool result is absent, the chunk stays queued for
+    // a later transform until the lazy 60-second expiry fail-closes the binding.
+    // The chunk rides the tool result (function_call_output) instead of a
+    // synthetic assistant part, whose interleaving a Responses endpoint may
+    // drop. OpenCode 1.18.35 reuses this hook during compaction with no
+    // reliable discriminator, so a queued chunk may still be delivered during a
+    // compaction request; the design accepts this limitation and does not
+    // claim exclusion.
+    const now = services.now()
+    const pending = services.queue.peek(sessionID, now)
     if (pending !== null) {
-      ensureChunkPart(single.messages, {
-        sessionID,
+      const attached = attachChunkToToolResult(single.messages, {
         messageID: pending.requestMessageID,
         chunkID: pending.id,
+        targetSessionID: pending.targetSessionID,
         text: chunkText({
           targetSessionID: pending.targetSessionID,
           cursorLabel: pending.cursorLabel,
@@ -72,6 +81,7 @@ export function createTransform(
           complete: pending.complete,
         }),
       })
+      if (attached === "attached") services.queue.take(sessionID, now)
     }
 
     const loaded = await services.state.load(sessionID)

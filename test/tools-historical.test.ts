@@ -315,6 +315,7 @@ test("transcript acknowledgements carry counts and cursors but never text", asyn
   assert.equal(result.cursor, null)
   assert.deepEqual(Object.keys(result).sort(), [
     "bytes",
+    "chunkID",
     "complete",
     "continuation",
     "cursor",
@@ -324,6 +325,7 @@ test("transcript acknowledgements carry counts and cursors but never text", asyn
     "sessionID",
     "status",
   ])
+  assert.equal(typeof result.chunkID, "string", "the ack carries the delivery correlation id")
   assert.equal(JSON.stringify(result).includes(TRANSCRIPT_SENTINEL), false)
   assert.deepEqual(ctx.asks[0].metadata, {})
   const pageCalls = calls.filter((call) => call.method === "messages")
@@ -340,6 +342,17 @@ test("transcript acknowledgements carry counts and cursors but never text", asyn
   assert.equal(foreign.status, "conflict")
   assert.match(foreign.reason, /cursor/)
   assert.equal(calls.filter((call) => call.method === "messages").length, 1)
+})
+
+test("the transcript description conveys the ack queue semantics", () => {
+  const { services } = makeServices(historicalConfig({ readTranscript: true }))
+  const tools = createHistoricalTools(services)
+  const description = String(tools.stm_history_transcript?.description ?? "")
+  assert.match(description, /never text/)
+  assert.match(description, /queue acknowledgement|not evidence/i)
+  assert.doesNotMatch(description, /delivery receipt/i)
+  assert.match(description, /later request|later outgoing request/i)
+  assert.match(description, /rename|conclusion/i)
 })
 
 test("transcript asks with empty metadata", async () => {

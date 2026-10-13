@@ -125,6 +125,77 @@ test("queue enforces one delivered page chunk at a time and cursor binding", () 
   )
 })
 
+test("peek returns the pending chunk without consuming it", () => {
+  const queue = createTranscriptQueue()
+  const token = beginToken(
+    queue,
+    { callerSessionID: "ses_call", targetSessionID: "ses_hist", requestMessageID: "msg_tool" },
+    0,
+  )
+  queue.supply("ses_call", { entries: [{ messageID: "m1", text: "body" }], nextCursor: "cursor-2" }, 0, token)
+
+  const first = queue.peek("ses_call", 0)
+  assert.notEqual(first, null, "an eligible chunk is peeked")
+  const second = queue.peek("ses_call", 0)
+  assert.equal(second?.id, first?.id, "peek does not consume the chunk")
+  assert.equal(queue.has("ses_call"), true, "peek creates no expiry side effects")
+
+  const taken = queue.take("ses_call", 0)
+  assert.equal(taken?.id, first?.id, "take returns the peeked chunk")
+  assert.equal(queue.take("ses_call", 0), null, "take is still one-shot")
+  assert.equal(queue.peek("ses_call", 0), null, "nothing is left to peek")
+})
+
+test("peek observes expiry lazily and fail-closes like take", () => {
+  const queue = createTranscriptQueue()
+  const token = beginToken(
+    queue,
+    { callerSessionID: "ses_call", targetSessionID: "ses_hist", requestMessageID: "msg_tool" },
+    0,
+  )
+  queue.supply("ses_call", { entries: [{ messageID: "m1", text: "body" }], nextCursor: "cursor-2" }, 0, token)
+  assert.equal(queue.peek("ses_call", QUEUE_TTL_MS - 1)?.text, "body", "eligible before the deadline")
+
+  assert.equal(queue.peek("ses_call", QUEUE_TTL_MS + 1), null, "the deadline is observed lazily on peek")
+  // The expiry is the same fail-closed transition take() performs: the expired
+  // chunk cannot be continued, only ended and restarted.
+  const expired = queue.begin(
+    { callerSessionID: "ses_call", targetSessionID: "ses_hist", requestMessageID: "msg_tool", cursor: "cursor-2" },
+    QUEUE_TTL_MS + 1,
+  )
+  assert.equal(expired.ok, false)
+  if (!expired.ok) assert.match(expired.reason, /expired/)
+  assert.equal(queue.endReview("ses_call", "ses_hist").ok, true)
+})
+
+test("supply ack carries the queued chunk id as safe metadata", () => {
+  const queue = createTranscriptQueue()
+  const token = beginToken(
+    queue,
+    { callerSessionID: "ses_call", targetSessionID: "ses_hist", requestMessageID: "msg_tool" },
+    0,
+  )
+  const supplied = queue.supply("ses_call", { entries: [{ messageID: "m1", text: "secret body" }], nextCursor: "cursor-2" }, 0, token)
+  assert.equal(supplied.ok, true)
+  assert.equal(supplied.ok && typeof supplied.ack.chunkID, "string", "the ack carries a correlation id")
+  assert.equal(
+    supplied.ok && supplied.ack.chunkID === queue.peek("ses_call", 0)?.id,
+    true,
+    "the ack chunk id correlates with the pending chunk",
+  )
+  assert.equal(
+    supplied.ok && JSON.stringify(supplied.ack).includes("secret body"),
+    false,
+    "the ack carries no raw text",
+  )
+
+  const empty = createTranscriptQueue()
+  const emptyToken = beginToken(empty, { callerSessionID: "ses_call", targetSessionID: "ses_hist", requestMessageID: "msg_tool" }, 0)
+  const zeroText = empty.supply("ses_call", { entries: [], nextCursor: null }, 0, emptyToken)
+  assert.equal(zeroText.ok, true)
+  assert.equal(zeroText.ok && zeroText.ack.chunkID, null, "a zero-text supply has no chunk id")
+})
+
 test("pending chunks expire after 60 seconds and require an explicit end and restart", () => {
   const queue = createTranscriptQueue()
   const token = beginToken(

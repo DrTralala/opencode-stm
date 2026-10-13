@@ -13,7 +13,7 @@ import { lockManually } from "../src/scheduler.js"
 import { createRootCache } from "../src/sdk.js"
 import { createTranscriptQueue } from "../src/transcript.js"
 import { createCurrentTools, type StmServices } from "../src/tools.js"
-import type { MutableMessage } from "../src/injection.js"
+import type { MutableMessage, MutablePart } from "../src/injection.js"
 import { fakeClient, type FakeHandler } from "./fakes.js"
 
 const DEFAULT_TITLE = "New session - 2026-10-10T00:00:00.000Z"
@@ -269,24 +269,34 @@ test("non-default first titles lock immediately", async () => {
   assert.equal(state.lockReason, "non-default-title")
 })
 
-test("a pending chunk is consumed by the next transform exactly once, even during a compaction-shaped request", async () => {
+test("a pending chunk is delivered into the completed tool result exactly once, even during a compaction-shaped request", async () => {
   const { services, stateDir, tools } = await transcriptServices()
-  await tools.stm_history_transcript!.execute({ sessionID: "ses_hist" } as any, toolContext())
+  const ack = JSON.parse(String(await tools.stm_history_transcript!.execute({ sessionID: "ses_hist" } as any, toolContext())))
+  assert.equal(ack.status, "ok")
 
+  const toolPart: MutablePart = {
+    id: "tool-1",
+    type: "tool",
+    tool: "stm_history_transcript",
+    state: { status: "completed", output: JSON.stringify(ack) },
+  }
   const messages: MutableMessage[] = [
     user("m1"),
-    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [{ id: "tool-1", type: "tool", tool: "stm_history_transcript" }] },
+    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [toolPart] },
     { info: { id: "summary-1", sessionID: "ses_1", role: "user", summary: { title: "s" } }, parts: [] },
   ]
   await createTransform(services)({}, { messages } as any)
-  const injected = messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-"))
-  assert.equal(injected.length, 1)
+  const output = String((toolPart.state as { output?: unknown }).output)
+  assert.ok(output.startsWith(JSON.stringify(ack)), "the ack prefix is intact")
+  assert.equal(output.includes(STM_SENTINEL), true)
+  assert.equal(messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-")).length, 0)
   assert.equal(JSON.stringify(readState(stateDir)).includes(STM_SENTINEL), false)
 
   await createTransform(services)({}, { messages } as any)
   assert.equal(
-    messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-")).length,
-    1,
+    String((toolPart.state as { output?: unknown }).output),
+    output,
+    "delivery is one-shot: no second frame is appended",
   )
 })
 
@@ -347,7 +357,7 @@ test("mixed-session transform is a no-op", async () => {
   assert.equal(readdirSync(stateDir).some((entry) => entry.endsWith(".json")), false)
 })
 
-test("missing anchor releases the pending chunk without injection", async () => {
+test("a missing anchor message retains the pending chunk without injection", async () => {
   const { services, tools } = await transcriptServices()
   await tools.stm_history_transcript!.execute({ sessionID: "ses_hist" } as any, toolContext("msg_gone"))
 
@@ -355,9 +365,9 @@ test("missing anchor releases the pending chunk without injection", async () => 
   await createTransform(services)({}, { messages } as any)
   assert.equal(messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-")).length, 0)
 
-  // The chunk was consumed by the failed attempt; nothing is injected later.
-  await createTransform(services)({}, { messages } as any)
-  assert.equal(messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-")).length, 0)
+  // The chunk was not consumed by the failed attempt: it stays queued for a
+  // later transform that can match it (or for the lazy expiry).
+  assert.notEqual(services.queue.take("ses_1", 0), null)
 })
 
 test("session.deleted removes only the hashed state file", async () => {
@@ -411,9 +421,16 @@ test("no transcript sentinel reaches state, tool result or reminder text", async
   const result = String(await tools.stm_history_transcript!.execute({ sessionID: "ses_hist" } as any, toolContext()))
   assert.equal(result.includes(STM_SENTINEL), false)
 
+  const ack = JSON.parse(result)
+  const toolPart: MutablePart = {
+    id: "tool-1",
+    type: "tool",
+    tool: "stm_history_transcript",
+    state: { status: "completed", output: JSON.stringify(ack) },
+  }
   const messages: MutableMessage[] = [
     user("m1"),
-    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [{ id: "tool-1", type: "tool", tool: "stm_history_transcript" }] },
+    { info: { id: "msg_tool", sessionID: "ses_1", role: "assistant" }, parts: [toolPart] },
   ]
   await createTransform(services)({}, { messages } as any)
   assert.equal(JSON.stringify(readState(stateDir)).includes(STM_SENTINEL), false)
@@ -422,10 +439,11 @@ test("no transcript sentinel reaches state, tool result or reminder text", async
   assert.ok(reminder, "reminder re-applied")
   assert.equal(String(reminder.text).includes(STM_SENTINEL), false)
 
-  // The delivered chunk is the one sanctioned carrier of the transcript text.
-  const chunk = messages.flatMap((message) => message.parts).find((part) => part.id?.startsWith("stm-transcript-"))
-  assert.ok(chunk, "chunk delivered")
-  assert.equal(String(chunk.text).includes(STM_SENTINEL), true)
+  // The delivered chunk rides the matching tool result; the ack head is intact.
+  const output = String((toolPart.state as { output?: unknown }).output)
+  assert.ok(output.startsWith(JSON.stringify(ack)), "the ack prefix is intact")
+  assert.equal(output.includes(STM_SENTINEL), true)
+  assert.equal(messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-")).length, 0)
 })
 
 test("a queued STM rename lands after the transform's guarded title check", async () => {

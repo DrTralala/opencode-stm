@@ -95,6 +95,10 @@ export type QueueAck = {
   more: boolean
   complete: boolean
   continuation: boolean
+  // Correlation id of the queued chunk: a random UUID, never raw text. The
+  // tool ack surfaces it so the outgoing transform can attach the framed
+  // chunk to the exact tool result that queued it.
+  chunkID: string | null
 }
 
 export type SupplyResult = { ok: true; ack: QueueAck } | { ok: false; reason: string }
@@ -112,6 +116,11 @@ export interface TranscriptQueue {
     token: string,
   ): SupplyResult
   take(callerSessionID: string, now: number): PendingChunk | null
+  // Peek the pending chunk without consuming it; expiry is observed lazily.
+  // The delivery contract is peek → attach → take with no await in between, so
+  // no other queue access can interleave; a chunk that cannot be attached
+  // stays queued until an eligible transform or the lazy expiry.
+  peek(callerSessionID: string, now: number): PendingChunk | null
   release(callerSessionID: string, token: string): boolean
   handoff(callerSessionID: string, token: string): HandoffResult
   endReview(callerSessionID: string, targetSessionID: string): EndReviewResult
@@ -349,8 +358,9 @@ export function createTranscriptQueue(options: { ttlMs?: number; maxCallers?: nu
       state.updatedAt = now
 
       const text = pieces.join("")
+      let chunkID: string | null = null
       if (text.length > 0) {
-        state.pending = {
+        const pending: PendingChunk = {
           id: randomUUID(),
           callerSessionID,
           targetSessionID: state.targetSessionID,
@@ -362,6 +372,8 @@ export function createTranscriptQueue(options: { ttlMs?: number; maxCallers?: nu
           createdAt: now,
           expiresAt: now + ttlMs,
         }
+        state.pending = pending
+        chunkID = pending.id
       } else {
         // A successful fetch with no visible text has no pending payload to
         // protect: consume the generation exactly like take() so a duplicate
@@ -379,6 +391,7 @@ export function createTranscriptQueue(options: { ttlMs?: number; maxCallers?: nu
           more: !state.complete,
           complete: state.complete,
           continuation: text.length > 0,
+          chunkID,
         },
       }
     },
@@ -394,6 +407,13 @@ export function createTranscriptQueue(options: { ttlMs?: number; maxCallers?: nu
       // Delivery ends the fetch attempt: a duplicate late supply cannot inject twice.
       state.requestToken = randomUUID()
       return pending
+    },
+
+    peek(callerSessionID, now) {
+      const state = states.get(callerSessionID)
+      if (state === undefined) return null
+      purgeExpired(state, now)
+      return state.pending
     },
 
     release(callerSessionID, token) {

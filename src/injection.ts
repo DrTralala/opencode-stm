@@ -123,31 +123,108 @@ export function chunkText(input: ChunkTextInput): string {
   ].join("\n")
 }
 
-export function makeChunkPart(input: {
-  sessionID: string
+export type ChunkAttachInput = {
   messageID: string
+  // Correlation id from the tool ack (safe metadata: a random UUID, never text).
   chunkID: string
+  // The framed chunk text produced by chunkText.
   text: string
-}): MutablePart {
-  return {
-    id: `stm-transcript-${input.chunkID}`,
-    sessionID: input.sessionID,
-    messageID: input.messageID,
-    type: "text",
-    text: input.text,
-    synthetic: true,
-    metadata: { "opencode-stm": { transcript: true, chunkID: input.chunkID } },
-  }
+  // Target session of the queued chunk (from the pending chunk): the ack must
+  // name the same target, so a foreign-target result can never be matched.
+  targetSessionID: string
 }
 
-export function ensureChunkPart(
+export type ChunkAttachResult = "attached" | "anchor-missing" | "result-missing" | "ambiguous"
+
+type ToolResultState = { status?: unknown; output?: unknown }
+
+function toolResultOutput(state: ToolResultState): string {
+  return typeof state.output === "string" ? state.output : JSON.stringify(state.output ?? "")
+}
+
+// Parse the leading JSON object of an ack output, tolerating trailing content
+// (host-appended markers, previously delivered framed text). The scan is
+// string-aware: braces, escapes and quotes inside string values never close
+// the object early. Any non-object, malformed object or non-JSON prefix fails
+// closed with null.
+function leadingAckObject(output: string): Record<string, unknown> | null {
+  let start = 0
+  while (start < output.length && /\s/.test(output[start]!)) start += 1
+  if (output[start] !== "{") return null
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let index = start; index < output.length; index += 1) {
+    const char = output[index]!
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === "\\") escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') inString = true
+    else if (char === "{") depth += 1
+    else if (char === "}") {
+      depth -= 1
+      if (depth === 0) {
+        try {
+          const parsed: unknown = JSON.parse(output.slice(start, index + 1))
+          if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null
+          return parsed as Record<string, unknown>
+        } catch {
+          return null
+        }
+      }
+    }
+  }
+  return null
+}
+
+// Exact ack correlation: the parsed object must be this plugin's successful
+// transcript ack for this exact chunk and target. The chunk id appearing
+// anywhere else in the output (appended text, other fields) never matches.
+function matchesAck(ack: Record<string, unknown>, input: ChunkAttachInput): boolean {
+  return ack.plugin === "opencode-stm" && ack.status === "ok" && ack.chunkID === input.chunkID && ack.sessionID === input.targetSessionID
+}
+
+// Outbound-only transcript delivery: the framed chunk is appended to the
+// matching completed stm_history_transcript tool result so it rides the same
+// wire item as every other tool result (function_call_output) instead of a
+// synthetic assistant part, whose interleaving a Responses endpoint may drop.
+// The match parses the result's leading ack JSON and requires the exact
+// plugin/status/chunkID/sessionID quadruple — never a substring search, tool
+// position or an untyped call id — so a host that appends markers to the
+// output string, several tool results in one message, an older ack for the
+// same target, or a chunk id embedded in unrelated output cannot misroute the
+// payload. When several results match exactly the same ack, the delivery fails
+// closed instead of guessing. Existing parts keep their position and identity;
+// the ack stays byte-identical at the head; the stored tool result is never
+// touched (the outgoing array is rebuilt from storage). The caller guarantees
+// the array is single-session and the message is located by the pending
+// chunk's requestMessageID.
+export function attachChunkToToolResult(
   messages: MutableMessage[],
-  input: { sessionID: string; messageID: string; chunkID: string; text: string },
-): "present" | "added" | "anchor-missing" {
+  input: ChunkAttachInput,
+): ChunkAttachResult {
   const message = findMessage(messages, input.messageID)
   if (message === undefined) return "anchor-missing"
-  const part = makeChunkPart(input)
-  if (message.parts.some((existing) => existing.id === part.id)) return "present"
-  message.parts.push(part)
-  return "added"
+  const matches: Array<MutablePart & { state: ToolResultState }> = []
+  for (const part of message.parts) {
+    if (part.type !== "tool" || part.tool !== "stm_history_transcript") continue
+    const state = part.state as ToolResultState | undefined
+    if (state === undefined || state.status !== "completed") continue
+    const ack = leadingAckObject(toolResultOutput(state))
+    if (ack === null || !matchesAck(ack, input)) continue
+    matches.push(part as MutablePart & { state: ToolResultState })
+  }
+  if (matches.length === 0) return "result-missing"
+  // Ambiguity fails closed: the chunk is retained rather than attached to a
+  // guessed first match.
+  if (matches.length > 1) return "ambiguous"
+  const result = matches[0]!
+  const original = toolResultOutput(result.state)
+  // A replayed delivery must never duplicate the frame.
+  if (original.includes(input.text)) return "attached"
+  result.state.output = original.length > 0 ? `${original}\n\n${input.text}` : input.text
+  return "attached"
 }
