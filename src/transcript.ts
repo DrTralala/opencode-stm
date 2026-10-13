@@ -9,18 +9,23 @@ export const PAGER_MAX_CALLERS = 16
 // any source progress. The message never echoes the oversized value.
 export const ENVELOPE_BUDGET_REASON = "pager: output envelope cannot fit the continuation budget"
 
-export type TextEntry = { messageID: string; text: string }
+export type TextEntry = { messageID: string; role: "user" | "assistant"; partIndex: number; text: string }
 
 export function extractVisibleText(items: PageMessage[]): TextEntry[] {
   const entries: TextEntry[] = []
   for (const item of items) {
     const role = item.info.role
     if (role !== "user" && role !== "assistant") continue
-    if (item.info.summary !== undefined) continue
-    for (const part of item.parts) {
+    // Ordinary user messages carry summary metadata (title/body/diffs): their
+    // visible text is real history and must be retained. Only an assistant
+    // message explicitly marked as a summary is synthetic output.
+    if (role === "assistant" && item.info.summary === true) continue
+    for (let partIndex = 0; partIndex < item.parts.length; partIndex += 1) {
+      const part = item.parts[partIndex]
+      if (part === undefined) continue
       if (part.type !== "text" || part.synthetic === true || part.ignored === true) continue
       if (typeof part.text !== "string" || part.text.length === 0) continue
-      entries.push({ messageID: item.info.id, text: part.text })
+      entries.push({ messageID: item.info.id, role, partIndex, text: part.text })
     }
   }
   return entries
@@ -82,10 +87,11 @@ type CallerState = {
   active: boolean
   // Committed cursor that produced the current page; undefined is the newest page.
   pageCursor: string | undefined
-  // Bytes of the current page's newline-joined entry stream already delivered.
-  // A single code-point-aligned offset is enough because the page is refetched
-  // whole on every continuation.
-  pageOffset: number
+  // Source progress within the current page: the next entry to deliver and the
+  // UTF-8 byte offset already delivered inside it. Progress is tracked on the
+  // source, never on serialized JSON, so record framing can change per chunk.
+  entryIndex: number
+  entryOffset: number
   complete: boolean
   // Cursor issued with the last exhausted page, or null while a page is partial.
   issuedCursor: string | null
@@ -102,13 +108,17 @@ type CallerState = {
 
 // Tagged and length-prefixed so no cursor value (including the literal "end")
 // can collide with the null cursor marker, and adjacent fields cannot alias.
+// Role and original part index are part of the identity: a page whose speaker
+// attribution or part numbering changed must fail closed like any text change.
 function digestPage(page: SupplyPage): string {
   const hash = createHash("sha256")
-  hash.update("stm-page-v1;")
+  hash.update("stm-page-v2;")
   for (const entry of page.entries) {
     const idBytes = Buffer.from(entry.messageID, "utf8")
     const textBytes = Buffer.from(entry.text, "utf8")
-    hash.update(`id:${idBytes.byteLength}:`)
+    hash.update(`role:${entry.role.length}:`)
+    hash.update(entry.role)
+    hash.update(`;part:${entry.partIndex};id:${idBytes.byteLength}:`)
     hash.update(idBytes)
     hash.update(`;text:${textBytes.byteLength}:`)
     hash.update(textBytes)
@@ -118,61 +128,118 @@ function digestPage(page: SupplyPage): string {
   return hash.digest("hex")
 }
 
-// The page source stream is the visible entries joined by a single newline.
-// Offsets always land on code-point boundaries and separators are part of the
-// stream, so concatenating delivered slices reproduces it byte-for-byte.
-type PageStream = { joined: Buffer; starts: number[]; lengths: number[] }
-
-function buildPageStream(entries: TextEntry[]): PageStream {
-  const buffers = entries.map((entry) => Buffer.from(entry.text, "utf8"))
-  const lengths = buffers.map((buffer) => buffer.byteLength)
-  const starts: number[] = []
-  let total = 0
-  for (let index = 0; index < buffers.length; index += 1) {
-    starts.push(total)
-    total += lengths[index]!
-    if (index + 1 < buffers.length) total += 1
-  }
-  const joined = Buffer.allocUnsafe(total)
-  let at = 0
-  for (let index = 0; index < buffers.length; index += 1) {
-    buffers[index]!.copy(joined, at)
-    at += lengths[index]!
-    if (index + 1 < buffers.length) {
-      joined[at] = 0x0a
-      at += 1
-    }
-  }
-  return { joined, starts, lengths }
-}
-
-// Entries completed by this result: the chunk that contains an entry's final
-// byte counts it, so every entry is counted exactly once across a partition of
-// the page stream. An entry ending exactly at the boundary belongs to the
-// earlier chunk.
-function countCompletedEntries(stream: PageStream, start: number, end: number): number {
-  let count = 0
-  for (let index = 0; index < stream.starts.length; index += 1) {
-    const entryEnd = stream.starts[index]! + stream.lengths[index]!
-    if (entryEnd > start && entryEnd <= end) count += 1
-  }
-  return count
-}
-
-function countNewlines(buffer: Buffer): number {
-  let count = 0
-  for (const byte of buffer) {
-    if (byte === 0x0a) count += 1
-  }
-  return count
-}
-
 // Largest code-point boundary at or below `offset`, so a cut never splits a
 // multi-byte code point.
 function snapDown(buffer: Buffer, offset: number): number {
   let end = Math.min(offset, buffer.byteLength)
   while (end > 0 && (buffer[end]! & 0b1100_0000) === 0b1000_0000) end -= 1
   return end
+}
+
+type RemainingPart = { entry: TextEntry; encoded: Buffer; start: number }
+
+function remainingParts(entries: TextEntry[], entryIndex: number, entryOffset: number): RemainingPart[] {
+  const parts: RemainingPart[] = []
+  for (let index = entryIndex; index < entries.length; index += 1) {
+    const entry = entries[index]!
+    const encoded = Buffer.from(entry.text, "utf8")
+    const start = index === entryIndex ? snapDown(encoded, entryOffset) : 0
+    parts.push({ entry, encoded, start })
+  }
+  return parts
+}
+
+function remainingBytes(parts: RemainingPart[]): number {
+  let total = 0
+  for (const part of parts) total += part.encoded.byteLength - part.start
+  return total
+}
+
+type EndPosition = { index: number; offset: number }
+
+// The end position after `count` source bytes from the start of the remaining
+// stream, snapped down to a code-point boundary inside its part.
+function endpointAt(parts: RemainingPart[], count: number): EndPosition {
+  let remaining = count
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index]!
+    const length = part.encoded.byteLength - part.start
+    if (remaining < length) return { index, offset: snapDown(part.encoded, part.start + remaining) }
+    if (remaining === length) return { index, offset: part.encoded.byteLength }
+    remaining -= length
+  }
+  const last = parts.length - 1
+  if (last < 0) return { index: -1, offset: 0 }
+  return { index: last, offset: parts[last]!.encoded.byteLength }
+}
+
+// Largest count of source bytes that still leaves the page strictly
+// incomplete, so a partial result never claims the rest of the page and never
+// causes an empty-success loop when the remainder cannot be rendered.
+function strictPartialBytes(parts: RemainingPart[]): number {
+  const total = remainingBytes(parts)
+  if (total === 0) return 0
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    const part = parts[index]!
+    if (part.encoded.byteLength - part.start <= 0) continue
+    const snapped = snapDown(part.encoded, part.encoded.byteLength - 1)
+    return total - (part.encoded.byteLength - snapped)
+  }
+  return 0
+}
+
+// Bytes of the first complete code point available from the remaining stream:
+// the smallest source count that still makes real progress. Zero when nothing
+// remains. Counts below this snap back to the current position and would
+// serialize no records, so a partial candidate must never be settled from them.
+function firstCodePointBytes(parts: RemainingPart[]): number {
+  for (const part of parts) {
+    if (part.encoded.byteLength - part.start <= 0) continue
+    let size = 1
+    while (
+      part.start + size < part.encoded.byteLength &&
+      (part.encoded[part.start + size]! & 0b1100_0000) === 0b1000_0000
+    ) {
+      size += 1
+    }
+    return size
+  }
+  return 0
+}
+
+type RenderedPayload = { payload: string; messages: number; bytes: number }
+
+// Serialize a complete JSON record for every source interval ending at
+// (endIndex, endOffset). Returns null as soon as the serialized payload alone
+// would exceed a whole output budget, so no unbounded page is serialized in
+// full merely to discover that it cannot fit.
+function renderPayload(parts: RemainingPart[], endIndex: number, endOffset: number): RenderedPayload | null {
+  const lines: string[] = []
+  let payloadBytes = 0
+  let messages = 0
+  let bytes = 0
+  for (let index = 0; index < parts.length; index += 1) {
+    if (index > endIndex) break
+    const part = parts[index]!
+    const end = index === endIndex ? endOffset : part.encoded.byteLength
+    if (end <= part.start) continue
+    const text = part.encoded.subarray(part.start, end).toString("utf8")
+    const fragment = {
+      role: part.entry.role,
+      messageID: part.entry.messageID,
+      partIndex: part.entry.partIndex,
+      offsetBytes: part.start,
+      partComplete: end === part.encoded.byteLength,
+      text,
+    }
+    const line = JSON.stringify(fragment)
+    payloadBytes += Buffer.byteLength(line, "utf8") + (lines.length === 0 ? 0 : 1)
+    if (payloadBytes > CHUNK_BYTES) return null
+    lines.push(line)
+    if (end === part.encoded.byteLength) messages += 1
+    bytes += end - part.start
+  }
+  return { payload: lines.join("\n"), messages, bytes }
 }
 
 function continuationGuidance(cursor: string | null, complete: boolean): string {
@@ -189,16 +256,18 @@ type OutputInput = {
   bytes: number
   cursor: string | null
   complete: boolean
-  text: string
+  payload: string
 }
 
-// One JSON metadata header line, a blank line, then the framed untrusted text.
-// Metadata, separators, framing and marker escaping all consume the budget.
+// One JSON metadata header line, a blank line, then the framed JSONL payload.
+// Metadata, separators, framing and record serialization all consume the
+// budget: callers must measure this complete string, not a source slice.
 function formatOutput(input: OutputInput): string {
   const header = JSON.stringify({
     plugin: "opencode-stm",
     status: "ok",
     sessionID: input.targetSessionID,
+    format: "jsonl",
     page: input.page,
     messages: input.messages,
     bytes: input.bytes,
@@ -211,7 +280,7 @@ function formatOutput(input: OutputInput): string {
     targetSessionID: input.targetSessionID,
     cursorLabel: input.cursorLabel,
     page: input.page,
-    text: input.text,
+    payload: input.payload,
     complete: input.complete,
   })
   return `${header}\n\n${frame}`
@@ -219,6 +288,35 @@ function formatOutput(input: OutputInput): string {
 
 function transcriptOutputFits(output: string): boolean {
   return Buffer.byteLength(output, "utf8") <= CHUNK_BYTES && output.split("\n").length <= CHUNK_LINES
+}
+
+type Candidate = { output: string; messages: number; bytes: number; endIndex: number; endOffset: number }
+
+type CandidateInput = {
+  parts: RemainingPart[]
+  endIndex: number
+  endOffset: number
+  targetSessionID: string
+  page: number
+  cursorLabel: string | null
+  cursor: string | null
+  complete: boolean
+}
+
+function renderCandidate(input: CandidateInput): Candidate | null {
+  const rendered = renderPayload(input.parts, input.endIndex, input.endOffset)
+  if (rendered === null) return null
+  const output = formatOutput({
+    targetSessionID: input.targetSessionID,
+    page: input.page,
+    cursorLabel: input.cursorLabel,
+    messages: rendered.messages,
+    bytes: rendered.bytes,
+    cursor: input.cursor,
+    complete: input.complete,
+    payload: rendered.payload,
+  })
+  return { output, messages: rendered.messages, bytes: rendered.bytes, endIndex: input.endIndex, endOffset: input.endOffset }
 }
 
 export function createTranscriptPager(options: { maxCallers?: number } = {}): TranscriptPager {
@@ -284,7 +382,8 @@ export function createTranscriptPager(options: { maxCallers?: number } = {}): Tr
           requestToken: randomUUID(),
           active: true,
           pageCursor: undefined,
-          pageOffset: 0,
+          entryIndex: 0,
+          entryOffset: 0,
           complete: false,
           issuedCursor: null,
           page: 1,
@@ -336,105 +435,115 @@ export function createTranscriptPager(options: { maxCallers?: number } = {}): Tr
 
       const digest = digestPage(page)
       const pending = state.pending
-      if (pending === null && state.pageOffset > 0 && state.pageDigest !== null && digest !== state.pageDigest) {
-        // The page changed under the stored offsets (new messages or edited
-        // text). Fail closed, drop the binding and require an explicit restart
-        // with no cursor; never guess, skip or mislabel content.
+      if (
+        pending === null &&
+        (state.entryIndex > 0 || state.entryOffset > 0) &&
+        state.pageDigest !== null &&
+        digest !== state.pageDigest
+      ) {
+        // The page changed under the stored offsets (new messages, edited text,
+        // changed speaker attribution or renumbered parts). Fail closed, drop
+        // the binding and require an explicit restart with no cursor; never
+        // guess, skip or mislabel content.
         detachAbort(state)
         states.delete(callerSessionID)
         return { ok: false, reason: "pager: page changed; restart the transcript review" }
       }
 
-      const stream = buildPageStream(page.entries)
-      const pageLength = stream.joined.byteLength
       // A pending page switch is owned by this fetch: render the new page from
       // its start while the committed metadata stays untouched.
       const effectivePage = pending === null ? state.page : pending.page
       const effectivePageCursor = pending === null ? state.pageCursor : pending.cursor
-      const start = pending === null ? Math.min(state.pageOffset, pageLength) : 0
-      const remainingLength = pageLength - start
+      const entryIndex = pending === null ? state.entryIndex : 0
+      const entryOffset = pending === null ? state.entryOffset : 0
       const cursorLabel = effectivePageCursor ?? null
-
-      const renderPartial = (endOffset: number): string =>
-        formatOutput({
-          targetSessionID: state.targetSessionID,
-          page: effectivePage,
-          cursorLabel,
-          messages: countCompletedEntries(stream, start, endOffset),
-          bytes: endOffset - start,
-          cursor: null,
-          complete: false,
-          text: stream.joined.subarray(start, endOffset).toString("utf8"),
-        })
+      const parts = remainingParts(page.entries, entryIndex, entryOffset)
+      const remainingTotal = remainingBytes(parts)
 
       // Commit only after a candidate has been rendered and verified to fit; a
       // pending page switch commits here too, and offsets never advance on a
       // refusal (releaseFetch discards the pending switch).
-      const settle = (output: string, endOffset: number, exhausted: boolean): SupplyResult => {
+      const settle = (candidate: Candidate, exhausted: boolean): SupplyResult => {
         if (state.pending !== null) {
           state.pageCursor = state.pending.cursor
           state.page = state.pending.page
-          state.pageOffset = 0
           state.pending = null
         }
         if (exhausted) {
-          state.pageOffset = 0
+          state.entryIndex = 0
+          state.entryOffset = 0
           state.complete = page.nextCursor === null
           state.issuedCursor = page.nextCursor
           state.pageDigest = null
         } else {
-          state.pageOffset = endOffset
+          state.entryIndex = entryIndex + candidate.endIndex
+          state.entryOffset = candidate.endOffset
           state.complete = false
           state.issuedCursor = null
           state.pageDigest = digest
         }
         releaseFetch(state)
-        return { ok: true, output }
+        return { ok: true, output: candidate.output }
       }
 
       // Candidate 1: finish the remaining page with its true completion/cursor
-      // metadata. The pre-checks bound the render: source bytes and newlines are
-      // lower bounds of the final output, so over-budget pages are never
-      // rendered in full.
-      if (remainingLength <= CHUNK_BYTES && countNewlines(stream.joined.subarray(start)) <= CHUNK_LINES) {
-        const output = formatOutput({
+      // metadata. Serialized source bytes are at least the source bytes, so a
+      // stream that already exceeds the whole byte cap is never serialized.
+      if (remainingTotal <= CHUNK_BYTES) {
+        const end = endpointAt(parts, remainingTotal)
+        const candidate = renderCandidate({
+          parts,
+          endIndex: end.index,
+          endOffset: end.offset,
           targetSessionID: state.targetSessionID,
           page: effectivePage,
           cursorLabel,
-          messages: countCompletedEntries(stream, start, pageLength),
-          bytes: remainingLength,
           cursor: page.nextCursor,
           complete: page.nextCursor === null,
-          text: stream.joined.subarray(start, pageLength).toString("utf8"),
         })
-        if (transcriptOutputFits(output)) return settle(output, pageLength, true)
+        if (candidate !== null && transcriptOutputFits(candidate.output)) return settle(candidate, true)
       }
 
-      // Candidate 2: the largest code-point-aligned prefix with partial
-      // metadata, strictly shorter than the remaining page so the "more of this
-      // page remains" guidance stays accurate. Binary search is monotone: the
-      // rendered output only grows as the prefix grows.
-      if (remainingLength > 0) {
-        const pageEndBoundary = snapDown(stream.joined, pageLength - 1)
-        const high = Math.min(start + CHUNK_BYTES, pageEndBoundary) - start
-        if (high > 0) {
-          const endFor = (count: number): number => snapDown(stream.joined, start + count)
-          const fitsAt = (count: number): boolean => transcriptOutputFits(renderPartial(endFor(count)))
-          if (fitsAt(0)) {
-            let lo = 0
-            let hi = high
-            if (fitsAt(hi)) {
-              lo = hi
-            } else {
-              while (lo < hi) {
-                const mid = Math.floor((lo + hi + 1) / 2)
-                if (fitsAt(mid)) lo = mid
-                else hi = mid - 1
-              }
-            }
-            const end = endFor(lo)
-            if (end > start) return settle(renderPartial(end), end, false)
+      // Candidate 2: the largest code-point-aligned source prefix strictly
+      // shorter than the remaining page, with partial metadata. Only counts
+      // that deliver at least one whole code point are eligible: below
+      // `minProgress` the endpoint snaps back to the current position, the
+      // record set is empty, and settling it would repeat forever without
+      // advancing. Over the eligible domain fitness is monotone: adding source
+      // bytes never shrinks the rendered output.
+      const strictLimit = strictPartialBytes(parts)
+      const minProgress = firstCodePointBytes(parts)
+      if (minProgress > 0 && strictLimit >= minProgress) {
+        const fitsAt = (count: number): Candidate | null => {
+          const end = endpointAt(parts, count)
+          const candidate = renderCandidate({
+            parts,
+            endIndex: end.index,
+            endOffset: end.offset,
+            targetSessionID: state.targetSessionID,
+            page: effectivePage,
+            cursorLabel,
+            cursor: null,
+            complete: false,
+          })
+          if (candidate === null || candidate.bytes === 0 || !transcriptOutputFits(candidate.output)) return null
+          return candidate
+        }
+        const largest = fitsAt(strictLimit)
+        if (largest !== null) return settle(largest, false)
+        // Presence sentinel: the search domain starts at the first
+        // progress-bearing count. If even that cannot fit, refuse rather than
+        // settle an empty partial.
+        if (fitsAt(minProgress) !== null) {
+          let lo = minProgress
+          let hi = strictLimit
+          while (lo < hi) {
+            const mid = Math.floor((lo + hi + 1) / 2)
+            if (fitsAt(mid) !== null) lo = mid
+            else hi = mid - 1
           }
+          const candidate = fitsAt(lo)
+          if (candidate !== null) return settle(candidate, false)
         }
       }
 

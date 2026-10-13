@@ -15,8 +15,6 @@ import { fakeClient, headerResponse, type FakeHandler } from "./fakes.js"
 const TRANSCRIPT_SENTINEL = "STM_TRANSCRIPT_SENTINEL_4321"
 const BEGIN_MARKER = "----- BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
 const END_MARKER = "----- END OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
-const ESCAPED_BEGIN = "-----\\ BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
-const ESCAPED_END = "-----\\ END OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
 
 const createdDirs: string[] = []
 
@@ -87,42 +85,43 @@ function headerOf(output: string): Record<string, any> {
   return JSON.parse(first)
 }
 
-// Single-pass inverse of the documented escape: escape tokens first, then
-// doubled backslashes.
-function decodeEscaped(text: string): string {
-  let decoded = ""
-  let index = 0
-  while (index < text.length) {
-    if (text.startsWith(ESCAPED_BEGIN, index)) {
-      decoded += BEGIN_MARKER
-      index += ESCAPED_BEGIN.length
-      continue
-    }
-    if (text.startsWith(ESCAPED_END, index)) {
-      decoded += END_MARKER
-      index += ESCAPED_END.length
-      continue
-    }
-    const char = text[index]!
-    if (char === "\\") {
-      assert.equal(text[index + 1], "\\", "the escaped payload doubles every literal backslash")
-      decoded += "\\"
-      index += 2
-      continue
-    }
-    decoded += char
-    index += 1
-  }
-  return decoded
+type Fragment = {
+  role: "user" | "assistant"
+  messageID: string
+  partIndex: number
+  offsetBytes: number
+  partComplete: boolean
+  text: string
 }
 
-// Recover the exact source slice of one output.
-function framePayload(output: string): string {
+// Parse each payload line independently as one complete JSON record.
+function fragmentsOf(output: string): Fragment[] {
   const lines = output.split("\n")
   const begin = lines.indexOf(BEGIN_MARKER)
   const end = lines.lastIndexOf(END_MARKER)
   assert.ok(begin >= 0 && end > begin, "output carries one well-formed frame")
-  return decodeEscaped(lines.slice(begin + 5, end).join("\n"))
+  const raw = lines.slice(begin + 5, end)
+  if (raw.length === 1 && raw[0] === "") return []
+  return raw.map((line) => JSON.parse(line) as Fragment)
+}
+
+// The exact source slice of an output that carries exactly one record.
+function soleText(output: string): string {
+  const fragments = fragmentsOf(output)
+  assert.equal(fragments.length, 1, "expected exactly one record")
+  return fragments[0]!.text
+}
+
+// Reassemble text by message identity and original part index across outputs.
+function reassembled(outputs: string[]): Map<string, string> {
+  const state = new Map<string, string>()
+  for (const output of outputs) {
+    for (const fragment of fragmentsOf(output)) {
+      const key = `${fragment.messageID}\u0000${fragment.partIndex}`
+      state.set(key, (state.get(key) ?? "") + fragment.text)
+    }
+  }
+  return state
 }
 
 function assertBounded(output: string): void {
@@ -374,9 +373,99 @@ test("transcript returns the framed text directly within both caps", async () =>
   assert.equal(header.complete, true)
   assert.equal(header.cursor, null)
   assert.equal("chunkID" in header, false)
-  assert.equal(framePayload(output), TRANSCRIPT_SENTINEL)
+  assert.equal(header.format, "jsonl")
+  assert.deepEqual(fragmentsOf(output), [
+    { role: "user", messageID: "m1", partIndex: 0, offsetBytes: 0, partComplete: true, text: TRANSCRIPT_SENTINEL },
+  ])
   assert.equal(output.split("\n")[1], "")
   assert.equal(output.split("\n")[2], BEGIN_MARKER)
+})
+
+test("a user message with summary metadata is delivered with its role and identity", async () => {
+  const { services } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async () => ({
+      data: [
+        {
+          info: { id: "u1", sessionID: "ses_target", role: "user", summary: { diffs: [] } },
+          parts: [{ id: "p1", type: "text", text: "please fix this" }],
+        },
+      ],
+      response: headerResponse("x-next-cursor", null),
+    }),
+  })
+  const tools = createHistoricalTools(services)
+  const output = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  const header = headerOf(output)
+  assert.equal(header.complete, true)
+  assert.equal(header.messages, 1)
+  assert.equal(header.bytes, Buffer.byteLength("please fix this", "utf8"))
+  assert.deepEqual(fragmentsOf(output), [
+    { role: "user", messageID: "u1", partIndex: 0, offsetBytes: 0, partComplete: true, text: "please fix this" },
+  ])
+})
+
+test("tool-level consecutive users and an interrupted assistant response stay attributed", async () => {
+  const { services } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async () => ({
+      data: [
+        { info: { id: "u1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "first" }] },
+        {
+          info: { id: "u2", sessionID: "ses_target", role: "user", summary: { title: "t" } },
+          parts: [{ type: "text", text: "second" }],
+        },
+        {
+          info: { id: "a1", sessionID: "ses_target", role: "assistant" },
+          parts: [
+            { type: "reasoning", text: "thinking" },
+            { type: "text", text: "partial saved answer" },
+          ],
+        },
+      ],
+      response: headerResponse("x-next-cursor", null),
+    }),
+  })
+  const tools = createHistoricalTools(services)
+  const output = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  const header = headerOf(output)
+  assert.equal(header.complete, true)
+  assert.equal(header.messages, 3)
+  assert.deepEqual(
+    fragmentsOf(output).map((fragment) => [fragment.role, fragment.messageID, fragment.partIndex, fragment.text]),
+    [
+      ["user", "u1", 0, "first"],
+      ["user", "u2", 0, "second"],
+      ["assistant", "a1", 1, "partial saved answer"],
+    ],
+  )
+})
+
+test("assistant summary true is excluded at tool level while summary false is kept", async () => {
+  const { services } = makeServices(historicalConfig({ readTranscript: true }), {
+    messages: async () => ({
+      data: [
+        { info: { id: "u1", sessionID: "ses_target", role: "user" }, parts: [{ type: "text", text: "question" }] },
+        {
+          info: { id: "s1", sessionID: "ses_target", role: "assistant", summary: true },
+          parts: [{ type: "text", text: "generated summary" }],
+        },
+        {
+          info: { id: "a1", sessionID: "ses_target", role: "assistant", summary: false },
+          parts: [{ type: "text", text: "real reply" }],
+        },
+      ],
+      response: headerResponse("x-next-cursor", null),
+    }),
+  })
+  const tools = createHistoricalTools(services)
+  const output = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  assert.deepEqual(
+    fragmentsOf(output).map((fragment) => [fragment.messageID, fragment.text]),
+    [
+      ["u1", "question"],
+      ["a1", "real reply"],
+    ],
+  )
+  assert.equal(output.includes("generated summary"), false)
 })
 
 test("transcript metadata carries counts, cursors and guidance but never text", async () => {
@@ -392,6 +481,7 @@ test("transcript metadata carries counts, cursors and guidance but never text", 
     "complete",
     "continuation",
     "cursor",
+    "format",
     "messages",
     "more",
     "page",
@@ -425,7 +515,7 @@ test("transcript pages deliver distinct continuations and stop when complete", a
   const firstHeader = headerOf(first)
   assert.equal(firstHeader.cursor, "cur-1")
   assert.equal(firstHeader.complete, false)
-  assert.equal(framePayload(first), "newest page")
+  assert.equal(soleText(first), "newest page")
 
   const second = await executeRaw(
     tools,
@@ -436,8 +526,8 @@ test("transcript pages deliver distinct continuations and stop when complete", a
   const secondHeader = headerOf(second)
   assert.equal(secondHeader.complete, true)
   assert.equal(secondHeader.page, 2)
-  assert.equal(framePayload(second), "older page")
-  assert.notEqual(framePayload(first), framePayload(second), "distinct continuations")
+  assert.equal(soleText(second), "older page")
+  assert.notEqual(soleText(first), soleText(second), "distinct continuations")
 
   const stopped = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
   assert.equal(stopped.status, "conflict")
@@ -451,20 +541,20 @@ test("transcript direct results stay bounded across same-page continuations", as
     messages: async () => sentinelPage(null, source),
   })
   const tools = createHistoricalTools(services)
-  const payloads: string[] = []
+  const outputs: string[] = []
   let cursor: string | undefined
   for (let index = 0; index < 10; index += 1) {
     const args = cursor === undefined ? { sessionID: "ses_target" } : { sessionID: "ses_target", cursor }
     const output = await executeRaw(tools, "stm_history_transcript", args, context())
     assertBounded(output)
     const header = headerOf(output)
-    payloads.push(framePayload(output))
+    outputs.push(output)
     if (header.complete) break
     cursor = header.cursor ?? undefined
   }
-  assert.ok(payloads.length >= 3, "40000 bytes need several bounded chunks")
-  assert.equal(payloads.join(""), source)
-  assert.equal(calls.filter((call) => call.method === "messages").length, payloads.length)
+  assert.ok(outputs.length >= 3, "40000 bytes need several bounded chunks")
+  assert.equal(reassembled(outputs).get("m1\u00000"), source)
+  assert.equal(calls.filter((call) => call.method === "messages").length, outputs.length)
 })
 
 test("the transcript description conveys direct persistent results", () => {
@@ -570,7 +660,7 @@ test("a failed next-page read retries with the cursor returned by the last resul
   assert.equal(secondHeader.page, 2)
   assert.equal(secondHeader.complete, true)
   assert.equal(secondHeader.cursor, null)
-  assert.equal(framePayload(second), "older page")
+  assert.equal(soleText(second), "older page")
   assert.equal(pageTwoAttempts, 2)
   assert.equal(calls.filter((call) => call.method === "messages").length, 3)
 })
@@ -592,7 +682,7 @@ test("an overlapping transcript fetch conflicts instead of racing offsets", asyn
   releasePage(sentinelPage(null))
   const output = await first
   assert.equal(headerOf(output).status, "ok")
-  assert.equal(framePayload(output), TRANSCRIPT_SENTINEL)
+  assert.equal(soleText(output), TRANSCRIPT_SENTINEL)
   assert.equal(calls.filter((call) => call.method === "messages").length, 1)
 })
 
@@ -611,7 +701,7 @@ test("a failed page read releases the fetch and the retry succeeds", async () =>
   assert.equal(services.transcripts.has("ses_caller"), true, "the binding is retained for a retry")
   const retried = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
   assert.equal(headerOf(retried).complete, true)
-  assert.equal(framePayload(retried), TRANSCRIPT_SENTINEL)
+  assert.equal(soleText(retried), TRANSCRIPT_SENTINEL)
   assert.equal(attempts, 2)
   assert.equal(calls.filter((call) => call.method === "messages").length, 2)
 })
@@ -631,7 +721,7 @@ test("a malformed page releases the fetch instead of wedging the binding", async
   // conflicting with an abandoned in-flight binding.
   const retried = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
   assert.equal(headerOf(retried).complete, true)
-  assert.equal(framePayload(retried), TRANSCRIPT_SENTINEL)
+  assert.equal(soleText(retried), TRANSCRIPT_SENTINEL)
   assert.equal(attempts, 2)
 })
 
@@ -698,7 +788,7 @@ test("transcript continuation survives the completed tool signal abort", async (
     context("ses_caller"),
   )
   assert.equal(headerOf(second).complete, true)
-  assert.equal(framePayload(second), "older page")
+  assert.equal(soleText(second), "older page")
   assert.equal(calls.some((call) => call.method === "messages" && call.options.query.before === "cur-1"), true)
 })
 
@@ -752,7 +842,7 @@ test("review end releases pagination state; sensitive blocks transcript and rena
   const ctx = context()
   const seeded = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, ctx)
   assert.equal(headerOf(seeded).status, "ok")
-  assert.equal(framePayload(seeded), TRANSCRIPT_SENTINEL)
+  assert.equal(soleText(seeded), TRANSCRIPT_SENTINEL)
   assert.equal(services.transcripts.has(ctx.sessionID), true, "the completed retrieval keeps its binding")
   const end = await execute(tools, "stm_history_review_end", { sessionID: "ses_target", outcome: "sensitive" }, ctx)
   assert.equal(end.status, "ok")

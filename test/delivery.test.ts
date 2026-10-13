@@ -20,8 +20,6 @@ import { fakeClient, headerResponse, type FakeHandler } from "./fakes.js"
 const DEFAULT_TITLE = "New session - 2026-10-10T00:00:00.000Z"
 const BEGIN_MARKER = "----- BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
 const END_MARKER = "----- END OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
-const ESCAPED_BEGIN = "-----\\ BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
-const ESCAPED_END = "-----\\ END OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"
 
 const createdDirs: string[] = []
 
@@ -57,41 +55,34 @@ function headerOf(output: string): Record<string, any> {
   return JSON.parse(first)
 }
 
-// Single-pass inverse of the documented escape: escape tokens first, then
-// doubled backslashes.
-function decodeEscaped(text: string): string {
-  let decoded = ""
-  let index = 0
-  while (index < text.length) {
-    if (text.startsWith(ESCAPED_BEGIN, index)) {
-      decoded += BEGIN_MARKER
-      index += ESCAPED_BEGIN.length
-      continue
-    }
-    if (text.startsWith(ESCAPED_END, index)) {
-      decoded += END_MARKER
-      index += ESCAPED_END.length
-      continue
-    }
-    const char = text[index]!
-    if (char === "\\") {
-      assert.equal(text[index + 1], "\\", "the escaped payload doubles every literal backslash")
-      decoded += "\\"
-      index += 2
-      continue
-    }
-    decoded += char
-    index += 1
-  }
-  return decoded
+type Fragment = {
+  role: "user" | "assistant"
+  messageID: string
+  partIndex: number
+  offsetBytes: number
+  partComplete: boolean
+  text: string
 }
 
-function framePayload(output: string): string {
+// Parse each payload line independently as one complete JSON record.
+function fragmentsOf(output: string): Fragment[] {
   const lines = output.split("\n")
   const begin = lines.indexOf(BEGIN_MARKER)
   const end = lines.lastIndexOf(END_MARKER)
   assert.ok(begin >= 0 && end > begin, "output carries one well-formed frame")
-  return decodeEscaped(lines.slice(begin + 5, end).join("\n"))
+  return lines.slice(begin + 5, end).map((line) => JSON.parse(line) as Fragment)
+}
+
+// Reassemble delivered text by message identity and original part index.
+function reassembled(outputs: string[]): Map<string, string> {
+  const state = new Map<string, string>()
+  for (const output of outputs) {
+    for (const fragment of fragmentsOf(output)) {
+      const key = `${fragment.messageID}\u0000${fragment.partIndex}`
+      state.set(key, (state.get(key) ?? "") + fragment.text)
+    }
+  }
+  return state
 }
 
 function transcriptPart(id: string, callID: string, output: string): MutablePart {
@@ -167,8 +158,8 @@ async function collectTwo(tools: Record<string, any>, source: string): Promise<[
   assert.equal(firstHeader.complete, false, "the fixture needs at least two chunks")
   const second = await fetchChunk(tools, firstHeader.cursor ?? undefined)
   assert.equal(headerOf(second).complete, true)
-  assert.equal(framePayload(first) + framePayload(second), source)
-  assert.notEqual(framePayload(first), framePayload(second))
+  assert.equal(reassembled([first, second]).get("h1\u00000"), source)
+  assert.notEqual(fragmentsOf(first)[0]?.text, fragmentsOf(second)[0]?.text)
   return [first, second]
 }
 
@@ -191,8 +182,8 @@ test("stored direct results survive cloned requests with an intervening message"
 
   // Both chunks remain available without any STM replay injection and contain
   // distinct source slices.
-  assert.equal(framePayload(partOne.state.output) + framePayload(partTwo.state.output), source)
-  assert.notEqual(framePayload(partOne.state.output), framePayload(partTwo.state.output))
+  assert.equal(reassembled([partOne.state.output, partTwo.state.output]).get("h1\u00000"), source)
+  assert.notEqual(fragmentsOf(partOne.state.output)[0]?.text, fragmentsOf(partTwo.state.output)[0]?.text)
   assert.equal(messages.flatMap((message) => message.parts).filter((part) => part.id?.startsWith("stm-transcript-")).length, 0)
   assert.equal(JSON.stringify(readState(stateDir)).includes(source.slice(0, 40)), false, "no raw text reaches state")
 })
@@ -217,7 +208,7 @@ test("review end never modifies already stored direct results", async () => {
   await createTransform(services)({}, { messages } as any)
   assert.equal(String((messages[1]!.parts[0] as MutablePart & { state: { output: string } }).state.output), first)
   assert.equal(String((messages[3]!.parts[0] as MutablePart & { state: { output: string } }).state.output), second)
-  assert.equal(framePayload(first) + framePayload(second), source)
+  assert.equal(reassembled([first, second]).get("h1\u00000"), source)
 })
 
 test("a sensitive review end cannot retract stored direct results", async () => {
@@ -239,7 +230,7 @@ test("a sensitive review end cannot retract stored direct results", async () => 
   const before = JSON.stringify(messages)
   await createTransform(services)({}, { messages } as any)
   assert.equal(JSON.stringify(messages), before, "a sensitive end does not alter past results")
-  assert.equal(framePayload(first) + framePayload(second), source)
+  assert.equal(reassembled([first, second]).get("h1\u00000"), source)
 })
 
 test("the transform ignores unrelated stored tool results", async () => {
