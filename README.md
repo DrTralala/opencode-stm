@@ -136,7 +136,7 @@ Publication is automated by `.github/workflows/publish.yml`, which runs on a pub
 
 1. Bump `version` in `package.json` and both root `version` fields in `package-lock.json`.
 2. Commit and push `main`, then create a stable tag named `vX.Y.Z` that matches the package version.
-3. Publish the GitHub Release for that tag. A build job checks out the release tag, rejects a tag/version mismatch or an already published version, runs `npm run typecheck` and the full test suite, then packs `opencode-stm-<version>.tgz`; a separate publish job downloads that tarball and runs `npm publish release/*.tgz --ignore-scripts --access public` with npm OIDC (`id-token: write`). Prereleases are skipped.
+3. Publish the GitHub Release for that tag. A build job checks out the release tag, rejects a tag/version mismatch or an already published version, runs `npm run typecheck` and the full test suite, then packs `opencode-stm-<version>.tgz`; a separate publish job downloads that tarball and runs `npm publish ./release/*.tgz --ignore-scripts --access public` with npm OIDC (`id-token: write`). Prereleases are skipped.
 
 npm trusted publishing must be configured on npmjs.com for the `DrTralala/opencode-stm` repository and the `publish.yml` workflow, with no environment and no stored npm token. The OIDC token exists only in the publish job, which installs no dependencies and runs no package lifecycle scripts; the build job that runs `npm ci`, the tests and the pack has read-only repository permissions. The runner's Node 24 bundles an npm that supports OIDC, so no global npm install is required. After a run, verify the published version, dist-tag and provenance on npm.
 

@@ -65,4 +65,4 @@ jobs:
           name: npm-package
           path: release
       - name: Publish to npm
-        run: npm publish release/*.tgz --ignore-scripts --access public
+        run: npm publish ./release/*.tgz --ignore-scripts --access public

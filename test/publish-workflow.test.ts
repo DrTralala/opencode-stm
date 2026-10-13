@@ -144,9 +144,7 @@ test("publish job publishes the downloaded tarball with lifecycle scripts disabl
   const job = publishJob()
   assert.equal(runSteps(job).length, 1)
   const publish = runSteps(job)[0]!
-  assert.match(publish.run, /npm publish release\/\*\.tgz/)
-  assert.match(publish.run, /--ignore-scripts/)
-  assert.match(publish.run, /--access public/)
+  assert.equal(publish.run.trim(), "npm publish ./release/*.tgz --ignore-scripts --access public")
   assert.ok(!usesOf(job).some((value) => value.startsWith("actions/checkout@")), "publish must not check out source")
   assert.doesNotMatch(publish.run, /npm (ci|install|run|test|pack)\b/, "publish job must not install dependencies or run build steps")
 })
