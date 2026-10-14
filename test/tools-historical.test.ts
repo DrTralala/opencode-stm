@@ -737,9 +737,11 @@ test("transcript rejects a child target after permission", async () => {
   assert.equal(calls.filter((call) => call.method === "messages").length, 0)
 })
 
-test("transcript cursor mismatch is a conflict without a refetch", async () => {
+test("transcript cursor mismatch does not refetch and cursorless recovery uses the saved bookmark", async () => {
   const { services, calls } = makeServices(historicalConfig({ readTranscript: true }), {
-    messages: async () => sentinelPage("cur-1", "partial"),
+    messages: async (options: any) => options.query.before === "cur-1"
+      ? sentinelPage(null, "older page")
+      : sentinelPage("cur-1", "newest page"),
   })
   const tools = createHistoricalTools(services)
   const first = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
@@ -753,9 +755,14 @@ test("transcript cursor mismatch is a conflict without a refetch", async () => {
   assert.equal(mismatched.status, "conflict")
   assert.match(mismatched.reason, /cursor/)
   assert.equal(calls.filter((call) => call.method === "messages").length, 1)
+  const recovered = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
+  assert.equal(headerOf(recovered).page, 2)
+  assert.equal(headerOf(recovered).complete, true)
+  assert.equal(soleText(recovered), "older page")
+  assert.deepEqual(calls.filter((call) => call.method === "messages").map((call) => call.options.query?.before), [undefined, "cur-1"])
 })
 
-test("a failed next-page read retries with the cursor returned by the last result", async () => {
+test("a failed next-page read retries without a cursor using the saved bookmark", async () => {
   let pageTwoAttempts = 0
   const { services, calls } = makeServices(historicalConfig({ readTranscript: true }), {
     messages: async (options: any) => {
@@ -775,12 +782,11 @@ test("a failed next-page read retries with the cursor returned by the last resul
   const cursor = headerOf(first).cursor
   assert.equal(cursor, "cur-1")
 
-  const failed = await execute(tools, "stm_history_transcript", { sessionID: "ses_target", cursor }, context())
+  const failed = await execute(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
   assert.equal(failed.status, "error")
 
-  // The exact cursor from the last successful result retries the same page and
-  // the page number advances exactly once.
-  const second = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target", cursor }, context())
+  // The saved cursor retries the same page and the page number advances exactly once.
+  const second = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context())
   const secondHeader = headerOf(second)
   assert.equal(secondHeader.status, "ok")
   assert.equal(secondHeader.page, 2)

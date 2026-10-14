@@ -154,8 +154,8 @@ function supply(pager: TranscriptPager, page: PageLike, token: string): string {
   return supplied.output
 }
 
-// Drive the pager like the tool does: follow header cursors, call again without
-// a cursor for same-page continuation, stop on completion.
+// Normal tool calls omit the cursor; the pager selects the backend bookmark for
+// both same-page continuations and page advances.
 function retrieveAll(
   pager: TranscriptPager,
   pageFor: (fetchCursor: string | undefined) => PageLike,
@@ -163,17 +163,16 @@ function retrieveAll(
 ): { outputs: string[]; headers: Header[]; continuity: Map<string, Continuity> } {
   const outputs: string[] = []
   const headers: Header[] = []
-  let cursor: string | undefined
   for (let index = 0; index < limit; index += 1) {
-    const token = beginToken(pager, cursor)
-    const output = supply(pager, pageFor(cursor), token)
+    const begun = pager.begin({ callerSessionID: CALLER, targetSessionID: TARGET })
+    if (!begun.ok) assert.fail(begun.reason)
+    const output = supply(pager, pageFor(begun.fetchCursor), begun.token)
     const header = assertBounded(output)
     outputs.push(output)
     headers.push(header)
     if (header.complete) {
       return { outputs, headers, continuity: continuityOf(outputs) }
     }
-    cursor = header.cursor ?? undefined
   }
   assert.fail(`review did not complete within ${limit} retrievals`)
 }
@@ -393,7 +392,7 @@ test("a session stopped with no assistant message yields no assistant fragment",
   assert.equal(fragments[0]?.role, "user")
 })
 
-test("exhausted pages require exactly the issued cursor and complete stops", () => {
+test("exhausted pages accept omitted or exact cursors and reject foreign cursors", () => {
   const pages = new Map<string, PageLike>([
     ["cur-2", { entries: [entry("older page")], nextCursor: null }],
   ])
@@ -407,8 +406,9 @@ test("exhausted pages require exactly the issued cursor and complete stops", () 
   assert.equal(soleText(first), "newest page")
 
   const missing = pager.begin({ callerSessionID: CALLER, targetSessionID: TARGET })
-  assert.equal(missing.ok, false)
-  if (!missing.ok) assert.match(missing.reason, /cursor/)
+  if (!missing.ok) assert.fail(missing.reason)
+  assert.equal(missing.fetchCursor, "cur-2")
+  assert.equal(pager.release(CALLER, missing.token), true)
 
   const foreign = pager.begin({ callerSessionID: CALLER, targetSessionID: TARGET, cursor: "foreign" })
   assert.equal(foreign.ok, false)
@@ -424,6 +424,33 @@ test("exhausted pages require exactly the issued cursor and complete stops", () 
   assert.equal(secondHeader.complete, true)
   assert.equal(soleText(second), "older page")
   assert.notEqual(soleText(first), soleText(second), "distinct continuations")
+})
+
+test("cursorless traversal preserves partial-page offsets after advancing past an empty page", () => {
+  const large = "older € text\n".repeat(3000)
+  const pages = new Map<string, PageLike>([
+    ["start", { entries: [], nextCursor: "cur-2" }],
+    ["cur-2", { entries: [entry(large, "m2")], nextCursor: "cur-3" }],
+    ["cur-3", { entries: [entry("oldest", "m3")], nextCursor: null }],
+  ])
+  const fetched: (string | undefined)[] = []
+  const pager = createTranscriptPager()
+  const result = retrieveAll(pager, (cursor) => {
+    fetched.push(cursor)
+    const page = pages.get(cursor ?? "start")
+    assert.ok(page)
+    return page
+  })
+  assert.equal(fetched[0], undefined)
+  assert.equal(fetched.at(-1), "cur-3")
+  assert.ok(fetched.slice(1, -1).length > 1, "page 2 spans multiple chunks")
+  assert.ok(fetched.slice(1, -1).every((cursor) => cursor === "cur-2"))
+  assert.deepEqual(result.headers.map((header) => header.page), [1, ...fetched.slice(1, -1).map(() => 2), 3])
+  assert.equal(result.continuity.get("m2\u00000")?.text, large)
+  assert.equal(result.continuity.get("m3\u00000")?.text, "oldest")
+  const stopped = pager.begin({ callerSessionID: CALLER, targetSessionID: TARGET })
+  assert.equal(stopped.ok, false)
+  if (!stopped.ok) assert.match(stopped.reason, /end of history/)
 })
 
 test("page numbers, messages and source-byte counters stay accurate across digit transitions", () => {
@@ -493,19 +520,16 @@ test("a failed fetch releases its token and leaves offsets retryable", () => {
   assert.equal(soleText(output), "retry body")
 })
 
-test("a failed next-page fetch retries with the same issued cursor exactly once", () => {
+test("a failed next-page fetch retries cursorlessly and advances exactly once", () => {
   const large = "o".repeat(CHUNK_BYTES + 10)
   const pager = createTranscriptPager()
   const first = beginToken(pager)
   supply(pager, { entries: [entry("newest")], nextCursor: "cur-2" }, first)
-  const advanced = beginToken(pager, "cur-2")
+  const advanced = beginToken(pager)
   assert.equal(pager.release(CALLER, advanced), true)
-  // The failed fetch rolled the page switch back: the cursor issued by the last
-  // successful result is still required, and omitting it is rejected.
-  const omission = pager.begin({ callerSessionID: CALLER, targetSessionID: TARGET })
-  assert.equal(omission.ok, false)
-  if (!omission.ok) assert.match(omission.reason, /cursor/)
-  const retry = pager.begin({ callerSessionID: CALLER, targetSessionID: TARGET, cursor: "cur-2" })
+  // The failed fetch rolled the page switch back: omitting the cursor retries
+  // the saved next-page bookmark rather than replaying or skipping a page.
+  const retry = pager.begin({ callerSessionID: CALLER, targetSessionID: TARGET })
   assert.equal(retry.ok, true)
   if (!retry.ok) return
   assert.equal(retry.fetchCursor, "cur-2")
@@ -569,9 +593,7 @@ test("an envelope refusal on a pending page switch rolls back to the issued curs
   assert.equal(refused.ok, false)
   if (!refused.ok) assert.equal(refused.reason, ENVELOPE_BUDGET_REASON)
   // The refused switch did not consume the cursor or advance the page.
-  const omission = pager.begin({ callerSessionID: CALLER, targetSessionID: TARGET })
-  assert.equal(omission.ok, false)
-  const retry = pager.begin({ callerSessionID: CALLER, targetSessionID: TARGET, cursor: "cur-1" })
+  const retry = pager.begin({ callerSessionID: CALLER, targetSessionID: TARGET })
   assert.equal(retry.ok, true)
   if (!retry.ok) return
   assert.equal(retry.fetchCursor, "cur-1")
@@ -1095,12 +1117,8 @@ test("a refusing partial on a pending page switch rolls back and stays retryable
   assert.equal(refused.ok, false)
   if (!refused.ok) assert.equal(refused.reason, ENVELOPE_BUDGET_REASON)
   // The refused switch consumed neither the cursor nor the page.
-  const omission = pager.begin({ callerSessionID: CALLER, targetSessionID: TARGET })
-  assert.equal(omission.ok, false)
-  if (!omission.ok) assert.match(omission.reason, /cursor/)
-
   // Unchanged source: the same cursor is refused again, not answered emptily.
-  const retry = beginToken(pager, "cur-2")
+  const retry = beginToken(pager)
   const again = pager.supply(CALLER, pathological, retry)
   assert.equal(again.ok, false)
   if (!again.ok) assert.equal(again.reason, ENVELOPE_BUDGET_REASON)

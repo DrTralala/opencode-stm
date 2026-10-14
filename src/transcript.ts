@@ -244,8 +244,8 @@ function renderPayload(parts: RemainingPart[], endIndex: number, endOffset: numb
 
 function continuationGuidance(cursor: string | null, complete: boolean): string {
   if (complete) return "End of history for this target: stop calling stm_history_transcript."
-  if (cursor !== null) return "More history remains: call stm_history_transcript again with this cursor."
-  return "More of this page remains: call stm_history_transcript again without a cursor."
+  if (cursor !== null) return "More history remains: call stm_history_transcript again with the same sessionID and without a cursor."
+  return "More of this page remains: call stm_history_transcript again with the same sessionID and without a cursor."
 }
 
 type OutputInput = {
@@ -399,18 +399,18 @@ export function createTranscriptPager(options: { maxCallers?: number } = {}): Tr
       }
       if (state.active) return { ok: false, reason: "pager: fetch in progress" }
       if (state.complete) return { ok: false, reason: "pager: end of history" }
-      const normalized = input.cursor ?? null
-      if (normalized !== state.issuedCursor) {
-        return { ok: false, reason: "pager: cursor not issued to this caller/target" }
+      if (input.cursor !== undefined && input.cursor !== state.issuedCursor) {
+        return { ok: false, reason: "pager: cursor not issued to this caller/target; retry with the same sessionID and without a cursor" }
       }
       let fetchCursor = state.pageCursor
-      if (input.cursor !== undefined) {
+      if (state.issuedCursor !== null) {
         // The exhausted page issued this cursor: select the next page but do
         // not consume the cursor or advance the committed page yet. A failed
         // read or a refusal must leave the same cursor retryable; only a
-        // successful supply commits the switch.
-        state.pending = { cursor: input.cursor, page: state.page + 1 }
-        fetchCursor = input.cursor
+        // successful supply commits the switch. Omitted input uses the saved
+        // bookmark so callers need not copy opaque cursors between calls.
+        state.pending = { cursor: state.issuedCursor, page: state.page + 1 }
+        fetchCursor = state.issuedCursor
       }
       setRequestSignal(input.callerSessionID, state, input.signal)
       state.requestToken = randomUUID()

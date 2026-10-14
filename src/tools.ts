@@ -458,8 +458,11 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
   if (services.config.historical.readTranscript) {
     tools.stm_history_transcript = tool({
       description:
-        "Opt-in retrieval of one bounded chunk of another root session's visible user/assistant text, returned directly in this tool result and persisted with the session like any other result. Each result is at most 16 KiB and 1999 lines and carries page, cursor, completion and continuation metadata. The framed payload is JSON Lines: every line is a complete JSON record with role, messageID, partIndex, offsetBytes, partComplete and text. Concatenating the text of records with the same messageID and partIndex, in order, reproduces that stored text part exactly; partComplete marks the end of the stored part, never a finished assistant response. Follow the continuation guidance: call again without a cursor for more of the same page, with the returned cursor for the next page, or stop when complete. Never returns reasoning or tool bodies.",
-      args: { sessionID: tool.schema.string(), cursor: tool.schema.optional(tool.schema.string()) },
+        "Opt-in retrieval of one bounded chunk of another root session's visible user/assistant text, returned directly in this tool result and persisted with the session like any other result. Each result is at most 16 KiB and 1999 lines and carries page, cursor, completion and continuation metadata. The framed payload is JSON Lines: every line is a complete JSON record with role, messageID, partIndex, offsetBytes, partComplete and text. Concatenating the text of records with the same messageID and partIndex, in order, reproduces that stored text part exactly; partComplete marks the end of the stored part, never a finished assistant response. Call with sessionID only: STM remembers the position within and between pages. Continue with the same sessionID and no cursor, or stop when complete. Never returns reasoning or tool bodies.",
+      args: {
+        sessionID: tool.schema.string(),
+        cursor: tool.schema.optional(tool.schema.string().describe("Omit for normal calls: STM resumes from its saved position. Legacy explicit cursors must exactly match the cursor issued to this caller and target.")),
+      },
       async execute(args, context) {
         if (context.abort.aborted) return status({ status: "aborted" })
         if (args.sessionID === context.sessionID) return status({ status: "invalid", reason: "self-target" })
