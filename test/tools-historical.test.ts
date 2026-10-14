@@ -151,6 +151,132 @@ test("historical flags expose exactly their own tools", () => {
   assert.deepEqual(Object.keys(transcript).sort(), ["stm_history_review_end", "stm_history_transcript"])
 })
 
+function childHistoryServices() {
+  let title = "Historical title"
+  return makeServices(historicalConfig({ readTitles: true, renameTitles: true, readTranscript: true }), {
+    get: async (options: any) => ({ data: {
+      id: options.path.id,
+      title,
+      ...(["ses_child", "ses_sibling"].includes(options.path.id) ? { parentID: "ses_parent" } : {}),
+    } }),
+    update: async (options: any) => {
+      title = options.body.title
+      return { data: { id: options.path.id, title } }
+    },
+    messages: async (options: any) => sentinelPage(options.query.before === undefined ? "older" : null),
+  })
+}
+
+test("child callers can use all historical tools with target-scoped permission", async () => {
+  const { services, calls, dir } = childHistoryServices()
+  const tools = createHistoricalTools(services)
+  const ctx = context("ses_child")
+  ctx.agent = "general"
+  const read = await execute(tools, "stm_history_title_read", { sessionID: "ses_target" }, ctx)
+  assert.equal(read.status, "ok")
+  assert.equal(read.root, true)
+  const text = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, ctx)
+  assert.equal(soleText(text), TRANSCRIPT_SENTINEL)
+  assertBounded(text)
+  assert.equal((await execute(tools, "stm_history_review_end", {
+    sessionID: "ses_target", outcome: "reviewed",
+  }, ctx)).status, "ok")
+  assert.equal((await execute(tools, "stm_history_title_rename", {
+    sessionID: "ses_target", expectedTitle: "Historical title", title: "Reviewed history",
+  }, ctx)).status, "ok")
+  assert.equal(JSON.parse(readFileSync(targetStatePath(dir, "ses_target"), "utf8")).lockReason, "historical")
+  assert.deepEqual(ctx.asks.map((ask) => ask.permission), [
+    "stm_history_title_read", "stm_history_transcript", "stm_history_review_end", "stm_history_title_rename",
+  ])
+  assert.ok(ctx.asks.every((ask) => ask.patterns.length === 1 && ask.patterns[0] === "ses_target"))
+  assert.ok(calls.every((call) => ["ses_child", "ses_target"].includes(call.options.path.id)))
+})
+
+test("child historical calls preserve permission denial, self-target and child-target restrictions", async () => {
+  const { services, calls } = childHistoryServices()
+  const tools = createHistoricalTools(services)
+  const ctx = context("ses_child")
+  const cases = [
+    ["stm_history_title_read", {}],
+    ["stm_history_transcript", {}],
+    ["stm_history_review_end", { outcome: "sensitive" }],
+    ["stm_history_title_rename", { expectedTitle: "Historical title", title: "New title" }],
+  ] as const
+  for (const [name, args] of cases) {
+    const self = await execute(tools, name, { ...args, sessionID: "ses_child" }, ctx)
+    assert.equal(self.reason, "self-target")
+  }
+  assert.equal(calls.length, 0)
+  ctx.ask = async () => { throw new Error("denied") }
+  for (const [name, args] of cases) {
+    assert.equal((await execute(tools, name, { ...args, sessionID: "ses_target" }, ctx)).status, "denied")
+  }
+  assert.ok(calls.every((call) => call.method === "get" && call.options.path.id === "ses_child"))
+  assert.equal(services.blocked.size, 0)
+  const allowed = context("ses_child")
+  const childTitle = await execute(tools, "stm_history_title_read", { sessionID: "ses_sibling" }, allowed)
+  assert.equal(childTitle.status, "ok")
+  assert.equal(childTitle.root, false)
+  for (const name of ["stm_history_title_rename", "stm_history_transcript"]) {
+    const result = await execute(tools, name, {
+      sessionID: "ses_sibling", expectedTitle: "Historical title", title: "New title",
+    }, allowed)
+    assert.equal(result.status, "conflict")
+    assert.equal(result.reason, "child-target")
+  }
+  assert.equal(calls.some((call) => call.method !== "get"), false)
+})
+
+test("historical tools fail closed when caller lookup fails", async () => {
+  const { services, calls } = makeServices(
+    historicalConfig({ readTitles: true, renameTitles: true, readTranscript: true }),
+    { get: async () => ({ error: "unavailable" }) },
+  )
+  const ctx = context("ses_child")
+  const tools = createHistoricalTools(services)
+  for (const name of Object.keys(tools)) {
+    assert.equal((await execute(tools, name, {
+      sessionID: "ses_target", expectedTitle: "Historical title", title: "New", outcome: "sensitive",
+    }, ctx)).status, "error")
+  }
+  assert.equal(ctx.asks.length, 0)
+  assert.ok(calls.every((call) => call.method === "get" && call.options.path.id === "ses_child"))
+  assert.equal(services.blocked.size, 0)
+})
+
+test("child pagination and sensitive blocks are isolated from parent and sibling callers", async () => {
+  const { services, calls } = childHistoryServices()
+  const tools = createHistoricalTools(services)
+  const child = context("ses_child")
+  const first = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, child)
+  const cursor = headerOf(first).cursor
+  assert.equal(cursor, "older")
+  for (const caller of ["ses_parent", "ses_sibling"]) {
+    const stolen = await execute(tools, "stm_history_transcript", { sessionID: "ses_target", cursor }, context(caller))
+    assert.equal(stolen.status, "conflict")
+    const own = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target" }, context(caller))
+    assert.equal(headerOf(own).cursor, "older")
+    assert.equal(soleText(own), TRANSCRIPT_SENTINEL)
+  }
+  assert.equal((await execute(tools, "stm_history_review_end", { sessionID: "ses_target", outcome: "sensitive" }, child)).status, "ok")
+  const callsBeforeBlocked = calls.length
+  for (const name of ["stm_history_transcript", "stm_history_title_rename"]) {
+    const blocked = await execute(tools, name, {
+      sessionID: "ses_target", expectedTitle: "Historical title", title: "Blocked",
+    }, child)
+    assert.equal(blocked.reason, "sensitive-blocked")
+  }
+  assert.equal(calls.length, callsBeforeBlocked)
+  for (const caller of ["ses_parent", "ses_sibling"]) {
+    const continued = await executeRaw(tools, "stm_history_transcript", { sessionID: "ses_target", cursor }, context(caller))
+    assert.equal(headerOf(continued).complete, true)
+    assert.equal(soleText(continued), TRANSCRIPT_SENTINEL)
+  }
+  assert.equal((await execute(tools, "stm_history_title_rename", {
+    sessionID: "ses_target", expectedTitle: "Historical title", title: "Sibling review",
+  }, context("ses_sibling"))).status, "ok")
+})
+
 test("historical title read asks first and never targets the caller", async () => {
   const { services, calls } = makeServices(historicalConfig({ readTitles: true }))
   const tools = createHistoricalTools(services)

@@ -41,13 +41,14 @@ function titleForStatus(title: string): { value: string; truncated: boolean } {
   return { value: `${points.slice(0, TITLE_DISPLAY_MAX).join("")}…`, truncated: true }
 }
 
-async function requireRootCaller(
+async function requireCaller(
   services: StmServices,
   context: ToolContext,
 ): Promise<{ ok: true } | { ok: false; status: string }> {
   const root = await services.roots.isRoot(context.sessionID, context.abort)
   if (!root.ok) return { ok: false, status: "error" }
-  if (!root.value) return { ok: false, status: "unsupported-child-session" }
+  // Validate the caller, but accept both root and child sessions. Only automatic
+  // reminders require a root; tool state and targets use the actual caller ID.
   return { ok: true }
 }
 
@@ -100,7 +101,7 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
     args: {},
     async execute(_args, context) {
       if (context.abort.aborted) return status({ status: "aborted" })
-      const caller = await requireRootCaller(services, context)
+      const caller = await requireCaller(services, context)
       if (!caller.ok) return status({ status: caller.status })
       const read = await readSession(services.client, context.sessionID, context.abort)
       if (!read.ok) return status({ status: "error" })
@@ -130,7 +131,7 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
     },
     async execute(args, context) {
       if (context.abort.aborted) return status({ status: "aborted" })
-      const caller = await requireRootCaller(services, context)
+      const caller = await requireCaller(services, context)
       if (!caller.ok) return status({ status: caller.status })
 
       let newTitle: string | null = null
@@ -302,7 +303,7 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
     args: { locked: tool.schema.boolean(), expectedTitle: tool.schema.string() },
     async execute(args, context) {
       if (context.abort.aborted) return status({ status: "aborted" })
-      const caller = await requireRootCaller(services, context)
+      const caller = await requireCaller(services, context)
       if (!caller.ok) return status({ status: caller.status })
       const loaded = await services.state.load(context.sessionID)
       if (!loaded.ok) return status({ status: "state-unavailable" })
@@ -367,7 +368,7 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
       async execute(args, context) {
         if (context.abort.aborted) return status({ status: "aborted" })
         if (args.sessionID === context.sessionID) return status({ status: "invalid", reason: "self-target" })
-        const caller = await requireRootCaller(services, context)
+        const caller = await requireCaller(services, context)
         if (!caller.ok) return status({ status: caller.status })
         const approved = await askOrAbort(context, "stm_history_title_read", args.sessionID, {})
         if (!approved.ok) return status({ status: approved.status })
@@ -393,7 +394,7 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
       async execute(args, context) {
         if (context.abort.aborted) return status({ status: "aborted" })
         if (args.sessionID === context.sessionID) return status({ status: "invalid", reason: "self-target" })
-        const caller = await requireRootCaller(services, context)
+        const caller = await requireCaller(services, context)
         if (!caller.ok) return status({ status: caller.status })
         if (isBlocked(services, context.sessionID, args.sessionID)) {
           return status({ status: "conflict", reason: "sensitive-blocked" })
@@ -462,7 +463,7 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
       async execute(args, context) {
         if (context.abort.aborted) return status({ status: "aborted" })
         if (args.sessionID === context.sessionID) return status({ status: "invalid", reason: "self-target" })
-        const caller = await requireRootCaller(services, context)
+        const caller = await requireCaller(services, context)
         if (!caller.ok) return status({ status: caller.status })
         if (isBlocked(services, context.sessionID, args.sessionID)) {
           return status({ status: "conflict", reason: "sensitive-blocked" })
@@ -546,7 +547,7 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
       async execute(args, context) {
         if (context.abort.aborted) return status({ status: "aborted" })
         if (args.sessionID === context.sessionID) return status({ status: "invalid", reason: "self-target" })
-        const caller = await requireRootCaller(services, context)
+        const caller = await requireCaller(services, context)
         if (!caller.ok) return status({ status: caller.status })
         const approved = await askOrAbort(context, "stm_history_review_end", args.sessionID, {
           outcome: args.outcome,

@@ -337,17 +337,73 @@ test("locked sessions reject rename but still allow keep and read", async () => 
   assert.equal(keep.status, "ok")
 })
 
-test("non-default first observation locks and child callers are rejected", async () => {
+test("non-default first observation locks", async () => {
   const locked = makeServices({ get: async (options: any) => ({ data: { id: options.path.id, title: "My notes" } }) })
   const lockedTool = createCurrentTools(locked.services)
   const lockedRead = await execute(lockedTool, "stm_title_read", {}, context())
   assert.equal(lockedRead.status, "ok")
   assert.equal(lockedRead.locked, true)
   assert.equal(lockedRead.lockReason, "non-default-title")
+})
 
-  const child = makeServices({}, "ses_parent")
-  const childTools = createCurrentTools(child.services)
-  assert.equal((await execute(childTools, "stm_title_read", {}, context())).status, "unsupported-child-session")
+test("child callers read, keep, rename and lock their own session, never the parent", async () => {
+  const { services, calls, dir } = makeServices({}, "ses_parent")
+  const tools = createCurrentTools(services)
+  const ctx = context("ses_child")
+  ctx.agent = "general"
+  const read = await execute(tools, "stm_title_read", {}, ctx)
+  assert.equal(read.status, "ok")
+  assert.equal(read.sessionID, "ses_child")
+  assert.equal(read.title, DEFAULT_TITLE)
+  assert.equal((await execute(tools, "stm_title_review", { decision: "keep", expectedTitle: DEFAULT_TITLE }, ctx)).status, "ok")
+  assert.equal((await execute(tools, "stm_title_review", {
+    decision: "rename", expectedTitle: DEFAULT_TITLE, title: "Child task",
+  }, ctx)).status, "ok")
+  for (const locked of [true, false]) {
+    const result = await execute(tools, "stm_title_lock", { locked, expectedTitle: "Child task" }, ctx)
+    assert.equal(result.status, "ok")
+    assert.equal(result.locked, locked)
+  }
+  assert.equal(readState(dir, "ses_child").titleDigest, hashTitle("Child task"))
+  assert.deepEqual(await services.state.load("ses_parent"), { ok: true, value: null })
+  assert.ok(calls.every((call) => call.options.path.id === "ses_child"))
+  assert.equal(calls.filter((call) => call.method === "update").length, 1)
+  assert.equal(ctx.asks.length, 4)
+  assert.ok(ctx.asks.every((ask) => ask.patterns.length === 1 && ask.patterns[0] === "ses_child"))
+})
+
+test("child current mutations still require permission", async () => {
+  const { services, calls } = makeServices({}, "ses_parent")
+  const tools = createCurrentTools(services)
+  const ctx = context("ses_child")
+  assert.equal((await execute(tools, "stm_title_read", {}, ctx)).status, "ok")
+  const before = await services.state.load("ses_child")
+  ctx.ask = async () => { throw new Error("denied") }
+  for (const [name, args] of [
+    ["stm_title_review", { decision: "keep", expectedTitle: DEFAULT_TITLE }],
+    ["stm_title_review", { decision: "rename", expectedTitle: DEFAULT_TITLE, title: "Denied" }],
+    ["stm_title_lock", { locked: true, expectedTitle: DEFAULT_TITLE }],
+  ] as const) {
+    assert.equal((await execute(tools, name, args, ctx)).status, "denied")
+  }
+  assert.deepEqual(await services.state.load("ses_child"), before)
+  assert.equal(calls.filter((call) => call.method === "update").length, 0)
+})
+
+test("current tools fail closed when caller lookup fails", async () => {
+  const { services, calls } = makeServices({ get: async () => ({ error: "unavailable" }) })
+  const tools = createCurrentTools(services)
+  const ctx = context("ses_child")
+  for (const [name, args] of [
+    ["stm_title_read", {}],
+    ["stm_title_review", { decision: "rename", expectedTitle: DEFAULT_TITLE, title: "Denied" }],
+    ["stm_title_lock", { locked: true, expectedTitle: DEFAULT_TITLE }],
+  ] as const) {
+    assert.equal((await execute(tools, name, args, ctx)).status, "error")
+  }
+  assert.equal(ctx.asks.length, 0)
+  assert.equal(calls.filter((call) => call.method === "update").length, 0)
+  assert.deepEqual(await services.state.load("ses_child"), { ok: true, value: null })
 })
 
 test("rename without a title is invalid", async () => {
