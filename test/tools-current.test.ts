@@ -10,7 +10,8 @@ import { hashSessionID, hashTitle, initialMeta, createStateStore, createOperatio
 import { createRootCache } from "../src/sdk.js"
 import { createTranscriptPager } from "../src/transcript.js"
 import { resolveReview, unlock } from "../src/scheduler.js"
-import { createCurrentTools, establishBaseline, validateTitle, type StmServices } from "../src/tools.js"
+import { createCurrentTools, createHistoricalTools, establishBaseline, validateTitle, type StmServices } from "../src/tools.js"
+import { createTransform } from "../src/index.js"
 import { fakeClient, type FakeHandler } from "./fakes.js"
 
 const DEFAULT_TITLE = "New session - 2026-10-10T00:00:00.000Z"
@@ -1233,4 +1234,201 @@ test("an unlock establishing the current digest during a deferred read prevents 
   assert.equal(state.lockReason, "none")
   assert.equal(state.titleDigest, hashTitle("Current Title"))
   assert.equal(state.review, null)
+})
+
+test("rename attribution is committed inside the title guard before a transform reads the title", async () => {
+  const { services, calls, dir } = makeServices()
+  await services.state.save("ses_1", {
+    ...initialMeta(),
+    activity: 20,
+    baselineMessageID: "m20",
+    review: { id: "rev-1", remindersSent: 1, nextTriggerAt: 60 },
+    titleDigest: hashTitle(DEFAULT_TITLE),
+  })
+  const tools = createCurrentTools(services)
+  const held = deferred()
+  const release = deferred()
+  const originalUpdate = services.state.update.bind(services.state)
+  const originalPresent = services.state.updateIfPresent.bind(services.state)
+  const originalGuard = services.guard
+  let paused = false
+  let transformEntered = false
+  const gate = async (): Promise<void> => {
+    if (!paused && calls.some((call) => call.method === "update")) {
+      paused = true
+      held.resolve()
+      await release.promise
+    }
+  }
+  services.state.update = async (sessionID, fn) => {
+    await gate()
+    return originalUpdate(sessionID, fn)
+  }
+  services.state.updateIfPresent = async (sessionID, fn) => {
+    await gate()
+    return originalPresent(sessionID, fn)
+  }
+  services.guard = {
+    run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+      return originalGuard.run(key, async () => {
+        if (paused) transformEntered = true
+        return fn()
+      })
+    },
+  }
+
+  const rename = execute(
+    tools,
+    "stm_title_review",
+    { decision: "rename", expectedTitle: DEFAULT_TITLE, title: "Guarded title", reviewID: "rev-1" },
+    context(),
+  )
+  await held.promise
+
+  const messages = [{
+    info: { id: "msg_current", sessionID: "ses_1", role: "assistant" },
+    parts: [{ id: "part_current", sessionID: "ses_1", messageID: "msg_current", type: "text", text: "Current" }],
+  }]
+  const transform = createTransform(services)
+  const transformed = transform({} as any, { messages } as any)
+  await flush()
+  assert.equal(transformEntered, false, "transform waits on the title guard")
+
+  release.resolve()
+  assert.equal((await rename).status, "ok")
+  await transformed
+  assert.equal(transformEntered, true)
+  const state = readState(dir, "ses_1")
+  assert.equal(state.locked, false)
+  assert.equal(state.lockReason, "none")
+  assert.equal(state.review, null)
+  assert.equal(state.titleDigest, hashTitle("Guarded title"))
+})
+
+test("successful explicit lifecycle changes cancel the coordinator outside the title guard", async () => {
+  const { services, dir } = makeServices()
+  await services.state.save("ses_1", {
+    ...initialMeta(),
+    activity: 20,
+    review: { id: "rev-1", remindersSent: 1, nextTriggerAt: 60 },
+    titleDigest: hashTitle(DEFAULT_TITLE),
+  })
+  const cancels: Array<{ parentID: string; reason: string; state: any }> = []
+  services.backgroundReviewer = {
+    start: async () => ({ status: "queued" as const }),
+    onEvent: async () => {},
+    reconcile: async () => {},
+    cancel: async (parentID: string, reason: string) => {
+      cancels.push({ parentID, reason, state: readState(dir, "ses_1") })
+    },
+    dispose: async () => {},
+  }
+  const tools = createCurrentTools(services)
+
+  assert.equal((await execute(
+    tools,
+    "stm_title_review",
+    { decision: "keep", expectedTitle: DEFAULT_TITLE, reviewID: "rev-1" },
+    context(),
+  )).status, "ok")
+  assert.deepEqual(cancels.map(({ parentID, reason }) => ({ parentID, reason })), [
+    { parentID: "ses_1", reason: "explicit-resolution" },
+  ])
+  assert.equal(cancels[0]?.state.review, null, "cancellation observes the committed resolution")
+
+  await services.state.save("ses_1", {
+    ...initialMeta(),
+    activity: 20,
+    review: { id: "rev-2", remindersSent: 1, nextTriggerAt: 60 },
+    titleDigest: hashTitle(DEFAULT_TITLE),
+  })
+  assert.equal((await execute(
+    tools,
+    "stm_title_review",
+    { decision: "rename", expectedTitle: DEFAULT_TITLE, title: "Lifecycle title", reviewID: "rev-2" },
+    context(),
+  )).status, "ok")
+  assert.equal(cancels.at(-1)?.reason, "explicit-resolution")
+  assert.equal(cancels.at(-1)?.state.review, null)
+
+  const lock = await execute(tools, "stm_title_lock", { locked: true, expectedTitle: "Lifecycle title" }, context())
+  assert.equal(lock.status, "ok")
+  assert.equal(cancels.at(-1)?.reason, "manual-lock")
+  assert.equal(cancels.at(-1)?.state.locked, true)
+
+  const unlock = await execute(tools, "stm_title_lock", { locked: false, expectedTitle: "Lifecycle title" }, context())
+  assert.equal(unlock.status, "ok")
+  assert.equal(cancels.at(-1)?.reason, "unlock")
+  assert.equal(cancels.at(-1)?.state.locked, false)
+  assert.equal(cancels.length, 4)
+
+  const beforeDenied = cancels.length
+  await services.state.save("ses_1", {
+    ...initialMeta(),
+    review: { id: "rev-3", remindersSent: 1, nextTriggerAt: 60 },
+    titleDigest: hashTitle("Lifecycle title"),
+  })
+  const denied = context()
+  denied.ask = async () => {
+    throw new Error("denied")
+  }
+  assert.equal((await execute(
+    tools,
+    "stm_title_review",
+    { decision: "keep", expectedTitle: "Lifecycle title", reviewID: "rev-3" },
+    denied,
+  )).status, "denied")
+  assert.equal(cancels.length, beforeDenied, "a permission denial does not cancel work")
+})
+
+test("historical rename locks the target and revokes pending background authority", async () => {
+  const { services, dir } = makeServices()
+  services.config = {
+    ...services.config,
+    historical: { ...services.config.historical, renameTitles: true },
+  }
+  await services.state.save("ses_2", {
+    ...initialMeta(),
+    activity: 20,
+    review: { id: "rev-2", remindersSent: 1, nextTriggerAt: 60 },
+    titleDigest: hashTitle(DEFAULT_TITLE),
+    backgroundReview: {
+      id: "attempt-2",
+      reviewID: "rev-2",
+      ownerID: "owner-2",
+      phase: "active",
+      titleDigest: hashTitle(DEFAULT_TITLE),
+      cutoffMessageID: "msg_dispatch",
+      activityAtDispatch: 20,
+      deadline: 120000,
+      childSessionID: "ses_child",
+      promptMessageID: "msg_prompt",
+      stop: "pending",
+      failureCode: null,
+    },
+  })
+  const cancels: string[] = []
+  services.backgroundReviewer = {
+    start: async () => ({ status: "queued" as const }),
+    onEvent: async () => {},
+    reconcile: async () => {},
+    cancel: async (parentID: string) => {
+      cancels.push(parentID)
+    },
+    dispose: async () => {},
+  }
+  const tools = createHistoricalTools(services)
+  const result = await execute(
+    tools,
+    "stm_history_title_rename",
+    { sessionID: "ses_2", expectedTitle: DEFAULT_TITLE, title: "Historical replacement" },
+    context(),
+  )
+  assert.equal(result.status, "ok")
+  const state = readState(dir, "ses_2")
+  assert.equal(state.locked, true)
+  assert.equal(state.lockReason, "historical")
+  assert.equal(state.backgroundReview?.phase, "failed")
+  assert.equal(state.backgroundReview?.failureCode, "background-revoked")
+  assert.deepEqual(cancels, ["ses_2"])
 })

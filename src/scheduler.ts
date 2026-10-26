@@ -1,4 +1,5 @@
 import { ANCHOR_MAX, FRONTIER_MAX, initialMeta, type AnchorState, type SessionMeta } from "./state.js"
+import { REVIEW_REVOCATION_REASONS, revokeReview } from "./background-state.js"
 import type { ReviewConfig } from "./config.js"
 import type { MutableMessage, MutablePart } from "./injection.js"
 
@@ -10,6 +11,7 @@ export const STM_TOOL_NAMES: readonly string[] = [
   "stm_history_title_rename",
   "stm_history_transcript",
   "stm_history_review_end",
+  "stm_title_review_start",
 ]
 
 export type ObservedMessage = { id: string; eligible: boolean; summary: boolean }
@@ -125,6 +127,12 @@ export function observe(
 
   if (next.locked || !config.enabled) return { meta: next, anchor: null }
 
+  // A delegated review owns the next title decision until it resolves or is
+  // revoked. Activity above was still counted; only reminder creation pauses.
+  if (config.reviewer !== undefined && next.backgroundReview?.phase === "active") {
+    return { meta: next, anchor: null }
+  }
+
   if (next.review === null && next.activity >= config.intervalMessages) {
     const anchorMessageID = lastEligibleID(observed)
     if (anchorMessageID === null) return { meta: next, anchor: null }
@@ -184,29 +192,41 @@ export function firstObservation(isDefault: boolean, digest: string): SessionMet
 }
 
 export function lockManually(meta: SessionMeta): SessionMeta {
-  return { ...meta, locked: true, lockReason: "manual" }
+  return revokeReview(
+    { ...meta, locked: true, lockReason: "manual" },
+    REVIEW_REVOCATION_REASONS.manualLock,
+  )
 }
 
 export function lockExternal(meta: SessionMeta): SessionMeta {
-  return { ...meta, locked: true, lockReason: "external" }
+  return revokeReview(
+    { ...meta, locked: true, lockReason: "external" },
+    REVIEW_REVOCATION_REASONS.externalTitleChange,
+  )
 }
 
 export function unlock(meta: SessionMeta, digest: string): SessionMeta {
   // Discard any pending review so the next scheduled review is created with a
   // fresh identifier; reset the activity baseline; keep existing anchors as
   // historical context so retained reminders are neither re-anchored nor moved.
-  return {
-    ...meta,
-    activity: 0,
-    locked: false,
-    lockReason: "none",
-    titleDigest: digest,
-    review: null,
-  }
+  return revokeReview(
+    {
+      ...meta,
+      activity: 0,
+      locked: false,
+      lockReason: "none",
+      titleDigest: digest,
+      review: null,
+    },
+    REVIEW_REVOCATION_REASONS.unlock,
+  )
 }
 
 export function resolveReview(meta: SessionMeta, digest: string): SessionMeta {
   // Retain resolved anchors unchanged: resolved reminders stay in place as
   // historical context and age out through obsolete marking and the cap.
-  return { ...meta, activity: 0, review: null, titleDigest: digest }
+  return revokeReview(
+    { ...meta, activity: 0, review: null, titleDigest: digest },
+    REVIEW_REVOCATION_REASONS.explicitResolution,
+  )
 }

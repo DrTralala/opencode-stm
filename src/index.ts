@@ -6,7 +6,9 @@ import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import type { Hooks, Plugin, PluginInput, PluginModule, ToolDefinition } from "@opencode-ai/plugin"
 import { loadConfig } from "./config.js"
-import { ensureAnchorPart, singleSessionMessages, type MutableMessage } from "./injection.js"
+import { createBackgroundReviewer } from "./background-review.js"
+import { ensureAnchorPart, removeAnchorPart, singleSessionMessages, type MutableMessage, type ReminderMode } from "./injection.js"
+import { applyBackgroundDecision, parseReviewDecision } from "./review-apply.js"
 import {
   anchorPartID,
   classifyMessages,
@@ -19,13 +21,29 @@ import {
 import { createRootCache, readSession } from "./sdk.js"
 import { createOperationGuard, createStateStore, hashTitle, resolveStateDir, type SessionMeta } from "./state.js"
 import { createTranscriptPager } from "./transcript.js"
-import { createCurrentTools, createHistoricalTools, type StmServices } from "./tools.js"
+import { createBackgroundTools, createCurrentTools, createHistoricalTools, type StmServices } from "./tools.js"
 
 export const STM_PLUGIN_ID = "opencode-stm"
 
 export type StmRuntime = { env?: NodeJS.ProcessEnv; home?: string; now?: () => number }
 
-type InjectionPlan = { anchors: SessionMeta["anchors"]; locked: boolean } | null
+type InjectionPlan = {
+  anchors: SessionMeta["anchors"]
+  locked: boolean
+  activeReviewID: string | null
+} | null
+
+function injectAnchors(messages: MutableMessage[], plan: InjectionPlan, mode: ReminderMode): void {
+  if (plan === null || plan.locked) return
+  for (const anchor of plan.anchors) {
+    if (mode === "background" && plan.activeReviewID !== null && anchor.reviewID === plan.activeReviewID) {
+      removeAnchorPart(messages, anchor)
+      continue
+    }
+    if (anchor.obsolete) continue
+    ensureAnchorPart(messages, anchor, mode)
+  }
+}
 
 // Drop an anchor the observation just created (and any review created with it):
 // it was never verified against the live title, so a later observation must
@@ -54,9 +72,14 @@ export function createTransform(
     const root = await services.roots.isRoot(sessionID)
     if (!root.ok || !root.value) return
 
+    // Root activity is also a lazy recovery point for stored background work.
+    // Never await model work or a remote stop here.
+    if (services.backgroundReviewer !== undefined) void services.backgroundReviewer.reconcile(sessionID)
+
     // Transcript retrieval returns its bounded result directly from the tool
     // call; the transform only owns title-review reminder injection.
 
+    const reminderMode: ReminderMode = services.config.review.reviewer === undefined ? "main" : "background"
     const loaded = await services.state.load(sessionID)
     if (!loaded.ok) return
     let fallback = loaded.value
@@ -93,13 +116,17 @@ export function createTransform(
         // its anchors here would skip the mandated title check; defer injection
         // to the next request, which takes the checked path.
         if (base.review !== null) return { next, result: null }
-        return { next, result: { anchors: next.anchors, locked: next.locked } }
+        return {
+          next,
+          result: {
+            anchors: next.anchors,
+            locked: next.locked,
+            activeReviewID: next.backgroundReview?.phase === "active" ? next.backgroundReview.reviewID : null,
+          },
+        }
       })
       if (!saved.ok) return
-      if (saved.value === null || saved.value.locked) return
-      for (const anchor of saved.value.anchors) {
-        if (!anchor.obsolete) ensureAnchorPart(single.messages, anchor)
-      }
+      injectAnchors(single.messages, saved.value, reminderMode)
       return
     }
 
@@ -131,26 +158,34 @@ export function createTransform(
             // written back over a concurrent resolution.
             return { next: lockExternal(stripUnverifiedAnchor(candidate, base)), result: null }
           }
-          return { next: candidate, result: { anchors: candidate.anchors, locked: candidate.locked } }
+          return {
+            next: candidate,
+            result: {
+              anchors: candidate.anchors,
+              locked: candidate.locked,
+              activeReviewID:
+                candidate.backgroundReview?.phase === "active" ? candidate.backgroundReview.reviewID : null,
+            },
+          }
         })
         if (!saved.ok) return { ok: false, reason: "state" }
         return { ok: true, plan: saved.value }
       },
     )
     if (!outcome.ok) return
-    if (outcome.plan === null || outcome.plan.locked) return
-    for (const anchor of outcome.plan.anchors) {
-      if (!anchor.obsolete) ensureAnchorPart(single.messages, anchor)
-    }
+    injectAnchors(single.messages, outcome.plan, reminderMode)
   }
 }
 
 export function createEventHook(services: StmServices): NonNullable<Hooks["event"]> {
   return async (input) => {
-    // Published 1.18.35 event types: only "session.deleted" is consumed; its
-    // properties.info is a Session. Runtime payloads are still checked before
-    // any cleanup runs.
     const event = input.event
+    // Forward first so an owned deletion revokes mutation authority and stops a
+    // known child before the historical cleanup below removes its metadata.
+    if (services.backgroundReviewer !== undefined) await services.backgroundReviewer.onEvent(event)
+    // Published 1.18.35 event types: only "session.deleted" is consumed by the
+    // pager cleanup; its properties.info is a Session. Runtime payloads are
+    // still checked before any cleanup runs.
     if (event.type !== "session.deleted") return
     const id = (event.properties.info as { id?: unknown } | undefined)?.id
     if (typeof id !== "string" || id.length === 0) return
@@ -187,17 +222,38 @@ export async function createStm(input: PluginInput, runtime: StmRuntime = {}): P
     blocked: new Map(),
     now,
   }
+  // A coordinator exists only when the reviewer is configured. It owns the
+  // parser/application binding so a child result never mutates a title directly.
+  if (loaded.config.review.reviewer !== undefined) {
+    services.backgroundReviewer = createBackgroundReviewer(services, async (input, signal) => {
+      const parsed = parseReviewDecision(input.structured)
+      if (!parsed.ok) return { status: "discarded" }
+      return applyBackgroundDecision(
+        services,
+        {
+          parentID: input.parentID,
+          attemptID: input.attemptID,
+          ownerID: input.ownerID,
+          decision: parsed.value,
+        },
+        signal,
+      )
+    })
+  }
   // Tool definitions are fixed for the instance lifetime; config changes need a
   // restart.
   const tools: Record<string, ToolDefinition> = {
     ...createCurrentTools(services),
     ...createHistoricalTools(services),
+    ...createBackgroundTools(services),
   }
   return {
     tool: tools,
     "experimental.chat.messages.transform": createTransform(services),
     event: createEventHook(services),
     dispose: async () => {
+      // Revoke and stop background work before releasing the caches it uses.
+      await services.backgroundReviewer?.dispose()
       services.transcripts.dispose()
       services.roots.clear()
     },

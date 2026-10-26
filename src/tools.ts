@@ -5,20 +5,13 @@ import { initialMeta, hashTitle, type SessionMeta, type StateStore, type Operati
 import { page, readSession, writeTitle, type Client, type RootCache } from "./sdk.js"
 import { ENVELOPE_BUDGET_REASON, extractVisibleText, type SupplyResult, type TranscriptPager } from "./transcript.js"
 import { firstObservation, isDefaultTitle, lockExternal, lockManually, resolveReview, unlock } from "./scheduler.js"
+import type { BackgroundReviewer } from "./background-review.js"
+import { REVIEW_REVOCATION_REASONS, revokeReview } from "./background-state.js"
+import { TITLE_MAX_CODE_POINTS, validateTitle, type TitleValidation } from "./title.js"
 
-export const TITLE_MAX_CODE_POINTS = 120
+export { TITLE_MAX_CODE_POINTS, validateTitle, type TitleValidation }
+
 const TITLE_DISPLAY_MAX = 200
-const CONTROL_CHARACTERS = /[\p{Cc}\u2028\u2029]/u
-
-export type TitleValidation = { ok: true; value: string } | { ok: false; reason: string }
-
-export function validateTitle(raw: string): TitleValidation {
-  const value = raw.trim()
-  if (value.length === 0) return { ok: false, reason: "title-empty" }
-  if ([...value].length > TITLE_MAX_CODE_POINTS) return { ok: false, reason: "title-too-long" }
-  if (CONTROL_CHARACTERS.test(value)) return { ok: false, reason: "title-control-characters" }
-  return { ok: true, value }
-}
 
 export type StmServices = {
   client: Client
@@ -29,10 +22,53 @@ export type StmServices = {
   guard: OperationGuard
   blocked: Map<string, Set<string>>
   now: () => number
+  backgroundReviewer?: BackgroundReviewer
 }
 
 function status(value: Record<string, unknown>): string {
   return JSON.stringify({ plugin: "opencode-stm", ...value })
+}
+
+export function createBackgroundTools(services: StmServices): Record<string, ToolDefinition> {
+  const reviewer = services.backgroundReviewer
+  if (reviewer === undefined) return {}
+  return {
+    stm_title_review_start: tool({
+      description:
+        "Dispatch the pending periodic title review to the configured background reviewer. Returns immediately after admission; it does not wait for or return the reviewer's transcript or decision.",
+      args: {
+        reviewID: tool.schema.string(),
+        expectedTitle: tool.schema.string(),
+        retry: tool.schema.optional(tool.schema.boolean()),
+      },
+      async execute(args, context) {
+        const result = await reviewer.start(
+          {
+            reviewID: args.reviewID,
+            expectedTitle: args.expectedTitle,
+            ...(args.retry === undefined ? {} : { retry: args.retry }),
+          },
+          context,
+        )
+        return status(result)
+      },
+    }),
+  }
+}
+
+async function cancelBackgroundReview(
+  services: StmServices,
+  parentID: string,
+  reason: string,
+): Promise<void> {
+  const reviewer = services.backgroundReviewer
+  if (reviewer === undefined) return
+  try {
+    await reviewer.cancel(parentID, reason)
+  } catch {
+    // The explicit state transition already revoked mutation authority. A
+    // coordinator failure must not turn a successful tool outcome into an error.
+  }
 }
 
 function titleForStatus(title: string): { value: string; truncated: boolean } {
@@ -215,8 +251,7 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
               return { ok: false, status: "conflict", reason: "expected-title-mismatch" }
             }
             let resolvedReviewID: string | null = null
-            const saved = await services.state.update(context.sessionID, (current) => {
-              const base = current ?? meta
+            const saved = await services.state.updateIfPresent(context.sessionID, (base) => {
               // Revalidate the caller-provided review ID against the latest
               // state: resolving, clearing or replacing the review while the ask
               // was pending conflicts instead of resolving a review the caller
@@ -230,6 +265,7 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
               return { next: resolveReview(base, hashTitle(confirm.value.title)), result: true }
             })
             if (!saved.ok) return { ok: false, status: "uncertain", reason: "state-save-failed" }
+            if (!saved.present) return { ok: false, status: "error" }
             if (saved.value === false) return { ok: false, status: "conflict", reason: "stale-review" }
             return { ok: true, reviewID: resolvedReviewID }
           },
@@ -241,6 +277,7 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
           if (outcome.status === "uncertain") return status({ status: "uncertain", reason: outcome.reason })
           return status({ status: outcome.status === "aborted" ? "aborted" : "error" })
         }
+        await cancelBackgroundReview(services, context.sessionID, REVIEW_REVOCATION_REASONS.explicitResolution)
         return status({ status: "ok", decision: "keep", reviewID: outcome.reviewID })
       }
 
@@ -279,6 +316,21 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
         const after = await readSession(services.client, context.sessionID, context.abort)
         if (context.abort.aborted) return { outcome: "uncertain" as const, reason: "aborted-during-write" as const }
         if (!after.ok || after.value.title !== newTitle) return { outcome: "uncertain" as const }
+        // Attribute the verified write while the title guard is still held:
+        // otherwise a transform can observe STM's own write as an external
+        // change before the digest is saved.
+        const saved = await services.state.updateIfPresent(context.sessionID, (current) => {
+          if (args.reviewID !== undefined && (current.review?.id ?? null) !== args.reviewID) {
+            return { next: current, result: "stale" as const }
+          }
+          return { next: resolveReview(current, hashTitle(after.value.title)), result: "saved" as const }
+        })
+        if (!saved.ok || !saved.present) {
+          return { outcome: "uncertain" as const, reason: "state-save-failed" as const }
+        }
+        if (saved.value === "stale") {
+          return { outcome: "conflict" as const, reason: "stale-review" as const }
+        }
         return { outcome: "renamed" as const, title: after.value.title }
       })
       if (outcome.outcome !== "renamed") {
@@ -289,11 +341,7 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
           ? status({ status: outcome.outcome, reason: outcome.reason })
           : status({ status: outcome.outcome })
       }
-      const saved = await services.state.update(context.sessionID, (current) => ({
-        next: resolveReview(current ?? meta, hashTitle(outcome.title)),
-        result: true,
-      }))
-      if (!saved.ok) return status({ status: "uncertain", reason: "state-save-failed" })
+      await cancelBackgroundReview(services, context.sessionID, REVIEW_REVOCATION_REASONS.explicitResolution)
       return status({ status: "ok", decision: "rename", title: outcome.title })
     },
   })
@@ -341,6 +389,11 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
         }
         return status({ status: "uncertain", reason: "state-save-failed" })
       }
+      await cancelBackgroundReview(
+        services,
+        context.sessionID,
+        outcome.locked ? REVIEW_REVOCATION_REASONS.manualLock : REVIEW_REVOCATION_REASONS.unlock,
+      )
       return status({ status: "ok", locked: outcome.locked })
     },
   })
@@ -433,6 +486,22 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
           const after = await readSession(services.client, args.sessionID, context.abort)
           if (context.abort.aborted) return { outcome: "uncertain" as const, reason: "aborted-during-write" }
           if (!after.ok || after.value.title !== valid.value) return { outcome: "uncertain" as const }
+          // Lock and reconcile any pending background authority atomically with
+          // the verified write, while the target's title guard is still held.
+          const saved = await services.state.update(args.sessionID, (current) => {
+            const base = current ?? initialMeta()
+            const locked = {
+              ...base,
+              locked: true,
+              lockReason: "historical" as const,
+              titleDigest: hashTitle(after.value.title),
+            }
+            return {
+              next: revokeReview(locked, REVIEW_REVOCATION_REASONS.titleReconciled),
+              result: true,
+            }
+          })
+          if (!saved.ok) return { outcome: "uncertain" as const, reason: "state-save-failed" }
           return { outcome: "renamed" as const, title: after.value.title }
         })
         if (outcome.outcome !== "renamed") {
@@ -440,16 +509,7 @@ export function createHistoricalTools(services: StmServices): Record<string, Too
             ? status({ status: outcome.outcome, reason: outcome.reason })
             : status({ status: outcome.outcome })
         }
-        // Lock the target's automatic review against the latest persisted state so a
-        // concurrent metadata change is preserved rather than overwritten.
-        const saved = await services.state.update(args.sessionID, (current) => {
-          const base = current ?? initialMeta()
-          return {
-            next: { ...base, locked: true, lockReason: "historical", titleDigest: hashTitle(outcome.title) },
-            result: true,
-          }
-        })
-        if (!saved.ok) return status({ status: "uncertain", reason: "state-save-failed" })
+        await cancelBackgroundReview(services, args.sessionID, REVIEW_REVOCATION_REASONS.titleReconciled)
         return status({ status: "ok", sessionID: args.sessionID, title: outcome.title })
       },
     })

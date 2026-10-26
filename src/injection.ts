@@ -54,7 +54,17 @@ export function hasPart(message: MutableMessage, partID: string): boolean {
   return message.parts.some((part) => part.id === partID)
 }
 
-export function reminderText(reviewID: string, reminderIndex: number): string {
+export type ReminderMode = "main" | "background"
+
+export function reminderText(reviewID: string, reminderIndex: number, mode: ReminderMode = "main"): string {
+  if (mode === "background") {
+    return [
+      `[opencode-stm] Title review ${reviewID} is due (reminder ${reminderIndex + 1}).`,
+      `Call stm_title_review_start with reviewID ${JSON.stringify(reviewID)} and expectedTitle equal to the current title, then continue your task.`,
+      `Do not collect the transcript, choose a title, or wait for or poll the reviewer.`,
+      `If this review is already active or resolved, ignore this reminder and continue without polling.`,
+    ].join(" ")
+  }
   return [
     `[opencode-stm] Title review ${reviewID} is due (reminder ${reminderIndex + 1}).`,
     `Ask the user for one decision: keep the current title or rename it.`,
@@ -63,13 +73,13 @@ export function reminderText(reviewID: string, reminderIndex: number): string {
   ].join(" ")
 }
 
-export function makeReminderPart(anchor: AnchorState, sessionID: string): MutablePart {
+export function makeReminderPart(anchor: AnchorState, sessionID: string, mode: ReminderMode = "main"): MutablePart {
   return {
     id: anchor.partID,
     sessionID,
     messageID: anchor.anchorMessageID,
     type: "text",
-    text: reminderText(anchor.reviewID, anchor.reminderIndex),
+    text: reminderText(anchor.reviewID, anchor.reminderIndex, mode),
     synthetic: true,
     metadata: { "opencode-stm": { reviewID: anchor.reviewID, reminderIndex: anchor.reminderIndex } },
   }
@@ -78,12 +88,35 @@ export function makeReminderPart(anchor: AnchorState, sessionID: string): Mutabl
 export function ensureAnchorPart(
   messages: MutableMessage[],
   anchor: AnchorState,
+  mode: ReminderMode = "main",
 ): "present" | "added" | "anchor-missing" {
   const message = findMessage(messages, anchor.anchorMessageID)
   if (message === undefined) return "anchor-missing"
   if (hasPart(message, anchor.partID)) return "present"
-  message.parts.push(makeReminderPart(anchor, message.info.sessionID ?? ""))
+  message.parts.push(makeReminderPart(anchor, message.info.sessionID ?? "", mode))
   return "added"
+}
+
+// Reused outgoing arrays can retain a synthetic reminder injected while the
+// review was still due. Remove only the part this anchor owns; user text, tool
+// calls and anchors from other reviews keep their position. Persisted anchors
+// are never changed, so a resolved review can be replayed as history later.
+export function removeAnchorPart(
+  messages: MutableMessage[],
+  anchor: AnchorState,
+): "removed" | "absent" | "anchor-missing" {
+  const message = findMessage(messages, anchor.anchorMessageID)
+  if (message === undefined) return "anchor-missing"
+  const index = message.parts.findIndex((part) => {
+    if (part.id !== anchor.partID || part.type !== "text" || part.synthetic !== true) return false
+    const marker = part.metadata?.["opencode-stm"]
+    if (typeof marker !== "object" || marker === null || Array.isArray(marker)) return false
+    const owned = marker as Record<string, unknown>
+    return owned.reviewID === anchor.reviewID && owned.reminderIndex === anchor.reminderIndex
+  })
+  if (index < 0) return "absent"
+  message.parts.splice(index, 1)
+  return "removed"
 }
 
 export type ChunkTextInput = {

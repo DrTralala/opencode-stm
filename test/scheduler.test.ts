@@ -2,6 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { DEFAULT_CONFIG } from "../src/config.js"
 import { FRONTIER_MAX, initialMeta, type AnchorState } from "../src/state.js"
+import type { BackgroundAttempt } from "../src/background-state.js"
 import {
   STM_TOOL_NAMES,
   anchorPartID,
@@ -33,6 +34,47 @@ const stmTool = (id: string, toolName: string): MutablePart => ({ id, type: "too
 function observedOf(messages: MutableMessage[]) {
   return classifyMessages(messages)
 }
+
+const REVIEWER_CONFIG = {
+  ...DEFAULT_CONFIG.review,
+  reviewer: {
+    agent: "worker",
+    timeoutSeconds: 120,
+    transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 },
+  },
+}
+
+function backgroundAttempt(overrides: Partial<BackgroundAttempt> = {}): BackgroundAttempt {
+  return {
+    id: "attempt-1",
+    reviewID: "rev-1",
+    ownerID: "owner-1",
+    phase: "active",
+    titleDigest: "digest-1",
+    cutoffMessageID: "msg_dispatch",
+    activityAtDispatch: 20,
+    deadline: 120000,
+    childSessionID: "ses_child",
+    promptMessageID: "msg_prompt",
+    stop: "pending",
+    failureCode: null,
+    ...overrides,
+  }
+}
+
+test("the dispatch tool is excluded from eligible activity", () => {
+  assert.ok(STM_TOOL_NAMES.includes("stm_title_review_start"))
+  assert.deepEqual(STM_TOOL_NAMES, [
+    "stm_title_read",
+    "stm_title_review",
+    "stm_title_lock",
+    "stm_history_title_read",
+    "stm_history_title_rename",
+    "stm_history_transcript",
+    "stm_history_review_end",
+    "stm_title_review_start",
+  ])
+})
 
 test("eligibility follows the design matrix", () => {
   const summaryUser: MutableMessage = {
@@ -445,6 +487,158 @@ test("a jump after the first reminder catches up one reminder per observation", 
   assert.equal(exhausted.meta.activity, 200)
   assert.equal(exhausted.meta.review?.remindersSent, 3)
   assert.equal(exhausted.anchor, null)
+})
+
+test("an active background review suppresses reminders but still counts activity", () => {
+  const config = REVIEWER_CONFIG
+  let meta = firstObservation(true, "digest-1")
+  meta = observe(meta, observedOf([user("m1")]), config, { newId: () => "rev-1" }).meta
+  meta = {
+    ...meta,
+    activity: 59,
+    review: { id: "rev-1", remindersSent: 1, nextTriggerAt: 60 },
+    backgroundReview: backgroundAttempt(),
+  }
+
+  const result = observe(meta, observedOf([user("m1"), user("m2")]), config, { newId: () => "rev-2" })
+  assert.equal(result.meta.activity, 60)
+  assert.deepEqual(result.meta.review, { id: "rev-1", remindersSent: 1, nextTriggerAt: 60 })
+  assert.equal(result.anchor, null)
+})
+
+test("an active background review suppresses a new review while counting", () => {
+  const config = REVIEWER_CONFIG
+  let meta = firstObservation(true, "digest-1")
+  meta = observe(meta, observedOf([user("m1")]), config, { newId: () => "rev-1" }).meta
+  meta = { ...meta, activity: 19, backgroundReview: backgroundAttempt() }
+
+  const result = observe(meta, observedOf([user("m1"), user("m2")]), config, { newId: () => "rev-2" })
+  assert.equal(result.meta.activity, 20)
+  assert.equal(result.meta.review, null)
+  assert.equal(result.anchor, null)
+})
+
+test("an orphaned active attempt does not suppress default-mode reminders", () => {
+  const config = DEFAULT_CONFIG.review
+  let meta = firstObservation(true, "digest-1")
+  meta = observe(meta, observedOf([user("m1")]), config, { newId: () => "rev-1" }).meta
+  meta = {
+    ...meta,
+    activity: 59,
+    review: { id: "rev-1", remindersSent: 1, nextTriggerAt: 60 },
+    backgroundReview: backgroundAttempt(),
+  }
+
+  const result = observe(meta, observedOf([user("m1"), user("m2")]), config, { newId: () => "rev-2" })
+  assert.equal(result.meta.activity, 60)
+  assert.deepEqual(result.meta.review, { id: "rev-1", remindersSent: 2, nextTriggerAt: 140 })
+  assert.equal(result.anchor?.reviewID, "rev-1")
+})
+
+test("an orphaned active attempt does not block a fresh default-mode review", () => {
+  const config = DEFAULT_CONFIG.review
+  let meta = firstObservation(true, "digest-1")
+  meta = observe(meta, observedOf([user("m1")]), config, { newId: () => "rev-1" }).meta
+  meta = { ...meta, activity: 19, backgroundReview: backgroundAttempt() }
+
+  const result = observe(meta, observedOf([user("m1"), user("m2")]), config, { newId: () => "rev-2" })
+  assert.equal(result.meta.activity, 20)
+  assert.equal(result.meta.review?.id, "rev-2")
+  assert.equal(result.anchor?.reviewID, "rev-2")
+})
+
+test("manual and external locks revoke without discarding the child reference", () => {
+  const attempt = backgroundAttempt()
+  const base = { ...initialMeta(), review: { id: "rev-1", remindersSent: 1, nextTriggerAt: 60 }, backgroundReview: attempt }
+
+  const manual = lockManually(base)
+  assert.equal(manual.locked, true)
+  assert.equal(manual.lockReason, "manual")
+  assert.equal(manual.backgroundReview?.phase, "failed")
+  assert.equal(manual.backgroundReview?.failureCode, "background-revoked")
+  assert.equal(manual.backgroundReview?.stop, "pending")
+  assert.equal(manual.backgroundReview?.childSessionID, "ses_child")
+
+  const external = lockExternal(base)
+  assert.equal(external.locked, true)
+  assert.equal(external.lockReason, "external")
+  assert.equal(external.backgroundReview?.phase, "failed")
+  assert.equal(external.backgroundReview?.stop, "pending")
+  assert.equal(external.backgroundReview?.childSessionID, "ses_child")
+})
+
+test("unlock revokes background authority and keeps the child until stop is confirmed", () => {
+  const meta = {
+    ...initialMeta(),
+    activity: 90,
+    locked: true,
+    lockReason: "manual" as const,
+    review: { id: "rev-1", remindersSent: 3, nextTriggerAt: 300 },
+    titleDigest: "digest-1",
+    backgroundReview: backgroundAttempt(),
+  }
+
+  const unlocked = unlock(meta, "digest-new")
+  assert.equal(unlocked.activity, 0)
+  assert.equal(unlocked.locked, false)
+  assert.equal(unlocked.lockReason, "none")
+  assert.equal(unlocked.review, null)
+  assert.equal(unlocked.titleDigest, "digest-new")
+  assert.equal(unlocked.backgroundReview?.phase, "failed")
+  assert.equal(unlocked.backgroundReview?.stop, "pending")
+  assert.equal(unlocked.backgroundReview?.childSessionID, "ses_child")
+})
+
+test("explicit resolution revokes an active attempt without changing counter semantics", () => {
+  const anchor: AnchorState = {
+    reviewID: "rev-1",
+    reminderIndex: 0,
+    anchorMessageID: "m9",
+    partID: "stm-reminder-rev-1-0",
+    obsolete: false,
+  }
+  const meta = {
+    ...initialMeta(),
+    activity: 30,
+    review: { id: "rev-1", remindersSent: 1, nextTriggerAt: 60 },
+    titleDigest: "digest-1",
+    anchors: [anchor],
+    backgroundReview: backgroundAttempt(),
+  }
+
+  const resolved = resolveReview(meta, "digest-new")
+  assert.equal(resolved.activity, 0)
+  assert.equal(resolved.review, null)
+  assert.equal(resolved.titleDigest, "digest-new")
+  assert.deepEqual(resolved.anchors, [anchor])
+  assert.equal(resolved.backgroundReview?.phase, "failed")
+  assert.equal(resolved.backgroundReview?.stop, "pending")
+  assert.equal(resolved.backgroundReview?.childSessionID, "ses_child")
+})
+
+test("explicit resolution clears an uncertain record only when its stop is confirmed", () => {
+  const pending = backgroundAttempt({
+    phase: "uncertain",
+    failureCode: "background-uncertain-write",
+  })
+  const pendingMeta = {
+    ...initialMeta(),
+    titleDigest: "digest-1",
+    review: { id: "rev-1", remindersSent: 1, nextTriggerAt: 60 },
+    backgroundReview: pending,
+  }
+  assert.equal(resolveReview(pendingMeta, "digest-new").backgroundReview, pending)
+
+  const confirmed = backgroundAttempt({
+    phase: "uncertain",
+    stop: "confirmed",
+    failureCode: "background-uncertain-write",
+  })
+  const confirmedMeta = { ...pendingMeta, backgroundReview: confirmed }
+  assert.equal(resolveReview(confirmedMeta, "digest-new").backgroundReview, null)
+
+  const manual = lockManually(confirmedMeta)
+  assert.equal(manual.backgroundReview, confirmed)
 })
 
 test("a custom-backoff jump keeps configured cumulative thresholds", () => {

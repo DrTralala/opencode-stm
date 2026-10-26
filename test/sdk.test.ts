@@ -1,8 +1,21 @@
 // test/sdk.test.ts
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { MESSAGE_PAGE_LIMIT, createRootCache, page, readSession, writeTitle } from "../src/sdk.js"
-import { fakeClient, headerResponse } from "./fakes.js"
+import {
+  MESSAGE_PAGE_LIMIT,
+  createReviewChild,
+  createRootCache,
+  page,
+  promptReviewChild,
+  readReviewCompletion,
+  readReviewExecutionContext,
+  readSession,
+  stopReviewChild,
+  writeTitle,
+  type PermissionRule,
+  type ReviewAgent,
+} from "../src/sdk.js"
+import { fakeClient, headerResponse, type FakeHandlers } from "./fakes.js"
 
 test("readSession rejects response data whose id does not match the request", async () => {
   const { client } = fakeClient({
@@ -280,4 +293,736 @@ test("writeTitle handles a rejected promise without retrying", async () => {
   if (result.ok) return
   assert.equal(result.reason.includes("raw update transport failure"), false)
   assert.equal(calls.length, 1)
+})
+
+// Background review SDK adapter.
+
+const PARENT = "ses_parent"
+const CHILD = "ses_child"
+const DISPATCH = "msg_dispatch"
+const PROMPT = "msg_prompt"
+const CALLER = "build"
+const REVIEWER = "title-worker"
+const REVIEWER_MODEL = { providerID: "probe", modelID: "reviewer" }
+
+function agentFixture(name: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name,
+    description: "",
+    mode: "subagent",
+    builtIn: false,
+    permission: { edit: "deny", bash: {}, tools: {} },
+    tools: {},
+    options: {},
+    ...extra,
+  }
+}
+
+function dispatchFixture(info: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    info: {
+      id: DISPATCH,
+      sessionID: PARENT,
+      role: "assistant",
+      parentID: "msg_user",
+      providerID: "parent-provider",
+      modelID: "parent-model",
+      time: { created: 1, completed: 2 },
+      ...info,
+    },
+    parts: [],
+  }
+}
+
+function runContext(
+  client: ReturnType<typeof fakeClient>["client"],
+  overrides: Partial<{
+    parentID: string
+    messageID: string
+    callerAgent: string
+    reviewerAgent: string
+  }> = {},
+  signal: AbortSignal = new AbortController().signal,
+) {
+  return readReviewExecutionContext(
+    client,
+    {
+      parentID: PARENT,
+      messageID: DISPATCH,
+      callerAgent: CALLER,
+      reviewerAgent: REVIEWER,
+      ...overrides,
+    },
+    signal,
+  )
+}
+
+test("review context uses the configured reviewer model and carries only parent restrictions", async () => {
+  const controller = new AbortController()
+  const { client, calls } = fakeClient({
+    agents: async () => ({
+      data: [
+        agentFixture(CALLER, {
+          mode: "primary",
+          model: { providerID: "caller-provider", modelID: "caller-model" },
+        }),
+        agentFixture(REVIEWER, { model: REVIEWER_MODEL, variant: "high" }),
+      ],
+    }),
+    message: async () => ({ data: dispatchFixture() }),
+    get: async () => ({
+      data: {
+        id: PARENT,
+        title: "Parent",
+        permission: [
+          { permission: "bash", pattern: "*", action: "deny" },
+          { permission: "edit", pattern: "*", action: "allow" },
+          { permission: "webfetch", pattern: "*", action: "ask" },
+        ],
+      },
+    }),
+  })
+  const result = await runContext(client, {}, controller.signal)
+  assert.equal(result.ok, true)
+  if (!result.ok) return
+  assert.deepEqual(result.value, {
+    agent: { name: REVIEWER, model: REVIEWER_MODEL, variant: "high" },
+    childPermissions: [
+      { permission: "bash", pattern: "*", action: "deny" },
+      { permission: "webfetch", pattern: "*", action: "ask" },
+      { permission: "*", pattern: "*", action: "deny" },
+    ],
+  })
+  assert.deepEqual(calls.map((call) => call.method), ["agents", "message", "get"])
+  assert.equal(calls[0]?.options.signal, controller.signal)
+  assert.deepEqual(calls[1]?.options.path, { id: PARENT, messageID: DISPATCH })
+  assert.equal(calls[1]?.options.signal, controller.signal)
+  assert.deepEqual(calls[2]?.options.path, { id: PARENT })
+  assert.equal(calls[2]?.options.signal, controller.signal)
+})
+
+test("review context falls back to the dispatch assistant model instead of the session model", async () => {
+  const { client } = fakeClient({
+    agents: async () => ({
+      data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER)],
+    }),
+    message: async () => ({ data: dispatchFixture() }),
+    get: async () => ({
+      data: {
+        id: PARENT,
+        title: "Parent",
+        model: { id: "session-model", providerID: "session-provider", variant: "default" },
+      },
+    }),
+  })
+  const result = await runContext(client)
+  assert.equal(result.ok, true)
+  if (!result.ok) return
+  assert.deepEqual(result.value.agent, {
+    name: REVIEWER,
+    model: { providerID: "parent-provider", modelID: "parent-model" },
+  })
+  assert.deepEqual(result.value.childPermissions, [
+    { permission: "*", pattern: "*", action: "deny" },
+  ])
+})
+
+test("review context reads the dispatch user message model shape when no agent model is configured", async () => {
+  const { client } = fakeClient({
+    agents: async () => ({ data: [agentFixture(REVIEWER)] }),
+    message: async () => ({
+      data: {
+        info: {
+          id: DISPATCH,
+          sessionID: PARENT,
+          role: "user",
+          time: { created: 1 },
+          model: { providerID: "user-provider", modelID: "user-model" },
+        },
+        parts: [],
+      },
+    }),
+    get: async () => ({ data: { id: PARENT, title: "Parent" } }),
+  })
+  const result = await runContext(client, { callerAgent: REVIEWER })
+  assert.equal(result.ok, true)
+  if (!result.ok) return
+  assert.deepEqual(result.value.agent.model, { providerID: "user-provider", modelID: "user-model" })
+})
+
+test("review context rejects disabled, missing and primary-only agents", async () => {
+  const cases: Array<{ name: string; agents: unknown[]; callerAgent?: string }> = [
+    {
+      name: "disabled reviewer",
+      agents: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER, { disable: true })],
+    },
+    {
+      name: "missing reviewer",
+      agents: [agentFixture(CALLER, { mode: "primary" })],
+    },
+    {
+      name: "primary-only reviewer",
+      agents: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER, { mode: "primary" })],
+    },
+    {
+      name: "missing caller",
+      agents: [agentFixture(REVIEWER)],
+    },
+    {
+      name: "malformed reviewer mode",
+      agents: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER, { mode: "other" })],
+    },
+  ]
+  for (const item of cases) {
+    const { client, calls } = fakeClient({ agents: async () => ({ data: item.agents }) })
+    const result = await runContext(client, { callerAgent: item.callerAgent ?? CALLER })
+    assert.equal(result.ok, false, item.name)
+    assert.equal(calls.length, 1, item.name)
+  }
+})
+
+test("review context sanitises agent, dispatch-message and session-read failures", async () => {
+  const cases: Array<{ name: string; handlers: FakeHandlers }> = [
+    {
+      name: "agent rejection",
+      handlers: {
+        agents: async () => ({ error: { message: "raw agent secret" } }),
+      },
+    },
+    {
+      name: "agent transport failure",
+      handlers: {
+        agents: async () => {
+          throw new Error("raw agent throw")
+        },
+      },
+    },
+    {
+      name: "dispatch rejection",
+      handlers: {
+        agents: async () => ({
+          data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER)],
+        }),
+        message: async () => ({ error: { message: "raw message secret" } }),
+      },
+    },
+    {
+      name: "session rejection",
+      handlers: {
+        agents: async () => ({
+          data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER)],
+        }),
+        message: async () => ({ data: dispatchFixture() }),
+        get: async () => ({ error: { message: "raw session secret" } }),
+      },
+    },
+  ]
+  for (const item of cases) {
+    const { client } = fakeClient(item.handlers)
+    const result = await runContext(client)
+    assert.equal(result.ok, false, item.name)
+    if (result.ok) continue
+    assert.equal(result.reason.includes("raw"), false, item.name)
+  }
+})
+
+test("review context rejects malformed agent, dispatch and permission data", async () => {
+  const cases: Array<{ name: string; handlers: FakeHandlers }> = [
+    {
+      name: "agents not an array",
+      handlers: { agents: async () => ({ data: { agents: [] } }) },
+    },
+    {
+      name: "dispatch id mismatch",
+      handlers: {
+        agents: async () => ({ data: [agentFixture(REVIEWER)] }),
+        message: async () => ({ data: dispatchFixture({ id: "msg_other" }) }),
+      },
+    },
+    {
+      name: "dispatch session mismatch",
+      handlers: {
+        agents: async () => ({ data: [agentFixture(REVIEWER)] }),
+        message: async () => ({ data: dispatchFixture({ sessionID: "ses_other" }) }),
+      },
+    },
+    {
+      name: "permission not an array",
+      handlers: {
+        agents: async () => ({ data: [agentFixture(REVIEWER)] }),
+        message: async () => ({ data: dispatchFixture() }),
+        get: async () => ({ data: { id: PARENT, title: "Parent", permission: "deny" } }),
+      },
+    },
+    {
+      name: "permission action invalid",
+      handlers: {
+        agents: async () => ({ data: [agentFixture(REVIEWER)] }),
+        message: async () => ({ data: dispatchFixture() }),
+        get: async () => ({
+          data: {
+            id: PARENT,
+            title: "Parent",
+            permission: [{ permission: "bash", pattern: "*", action: "sometimes" }],
+          },
+        }),
+      },
+    },
+  ]
+  for (const item of cases) {
+    const { client } = fakeClient(item.handlers)
+    const result = await runContext(client)
+    assert.equal(result.ok, false, item.name)
+  }
+})
+
+test("createReviewChild creates a restricted child with the agent, attempt title and final deny-all", async () => {
+  const controller = new AbortController()
+  const { client, calls } = fakeClient({
+    create: async () => ({ data: { id: CHILD, parentID: PARENT } }),
+  })
+  const agent: ReviewAgent = { name: REVIEWER, model: REVIEWER_MODEL }
+  const permissions: PermissionRule[] = [
+    { permission: "bash", pattern: "*", action: "deny" },
+    { permission: "*", pattern: "*", action: "deny" },
+    { permission: "edit", pattern: "*", action: "allow" },
+  ]
+  const result = await createReviewChild(
+    client,
+    { parentID: PARENT, agent, permissions, attemptID: "attempt-1" },
+    controller.signal,
+  )
+  assert.equal(result.ok, true)
+  if (result.ok) assert.deepEqual(result.value, { id: CHILD })
+  const call = calls[0]
+  assert.equal(call?.method, "create")
+  assert.deepEqual(call?.options.body, {
+    parentID: PARENT,
+    title: "STM title review attempt-1",
+    agent: REVIEWER,
+    permission: [
+      { permission: "bash", pattern: "*", action: "deny" },
+      { permission: "edit", pattern: "*", action: "allow" },
+      { permission: "*", pattern: "*", action: "deny" },
+    ],
+  })
+  assert.equal(call?.options.body.format, undefined)
+  assert.equal(call?.options.signal, controller.signal)
+})
+
+test("createReviewChild rejects malformed responses and sanitises failures", async () => {
+  const cases: Array<{ name: string; handler: FakeHandlers["create"] }> = [
+    { name: "missing data", handler: async () => ({}) },
+    { name: "missing id", handler: async () => ({ data: { parentID: PARENT } }) },
+    { name: "empty id", handler: async () => ({ data: { id: "", parentID: PARENT } }) },
+    { name: "parent mismatch", handler: async () => ({ data: { id: CHILD, parentID: "ses_other" } }) },
+    { name: "server rejection", handler: async () => ({ error: { message: "raw create secret" } }) },
+    {
+      name: "transport failure",
+      handler: async () => {
+        throw new Error("raw create throw")
+      },
+    },
+  ]
+  for (const item of cases) {
+    const { client, calls } = fakeClient({ create: item.handler })
+    const result = await createReviewChild(
+      client,
+      {
+        parentID: PARENT,
+        agent: { name: REVIEWER, model: REVIEWER_MODEL },
+        permissions: [],
+        attemptID: "attempt-1",
+      },
+      new AbortController().signal,
+    )
+    assert.equal(result.ok, false, item.name)
+    if (result.ok) continue
+    assert.equal(result.reason.includes("raw"), false, item.name)
+    assert.equal(calls.length, 1, item.name)
+  }
+})
+
+test("promptReviewChild sends the agent, model, variant and reserved prompt without format or tools", async () => {
+  const controller = new AbortController()
+  const { client, calls } = fakeClient({ promptAsync: async () => ({}) })
+  const result = await promptReviewChild(
+    client,
+    {
+      childID: CHILD,
+      promptMessageID: PROMPT,
+      agent: { name: REVIEWER, model: REVIEWER_MODEL, variant: "high" },
+      text: "review payload",
+    },
+    controller.signal,
+  )
+  assert.equal(result.ok, true)
+  if (result.ok) assert.equal(result.value, null)
+  const call = calls[0]
+  assert.equal(call?.method, "promptAsync")
+  assert.deepEqual(call?.options.path, { id: CHILD })
+  assert.deepEqual(call?.options.body, {
+    agent: REVIEWER,
+    model: REVIEWER_MODEL,
+    variant: "high",
+    messageID: PROMPT,
+    parts: [{ type: "text", text: "review payload" }],
+  })
+  assert.equal(call?.options.body.format, undefined)
+  assert.equal(call?.options.body.tools, undefined)
+  assert.equal(call?.options.signal, controller.signal)
+})
+
+test("promptReviewChild omits an absent variant and sanitises failures", async () => {
+  const omitted = fakeClient({ promptAsync: async () => ({ response: { status: 204 } }) })
+  const ok = await promptReviewChild(
+    omitted.client,
+    {
+      childID: CHILD,
+      promptMessageID: PROMPT,
+      agent: { name: REVIEWER, model: REVIEWER_MODEL },
+      text: "review payload",
+    },
+    new AbortController().signal,
+  )
+  assert.equal(ok.ok, true)
+  assert.equal(omitted.calls[0]?.options.body.variant, undefined)
+
+  const cases: Array<{ name: string; handler: FakeHandlers["promptAsync"] }> = [
+    { name: "server rejection", handler: async () => ({ error: { message: "raw prompt secret" } }) },
+    {
+      name: "transport failure",
+      handler: async () => {
+        throw new Error("raw prompt throw")
+      },
+    },
+  ]
+  for (const item of cases) {
+    const { client, calls } = fakeClient({ promptAsync: item.handler })
+    const result = await promptReviewChild(
+      client,
+      {
+        childID: CHILD,
+        promptMessageID: PROMPT,
+        agent: { name: REVIEWER, model: REVIEWER_MODEL },
+        text: "review payload",
+      },
+      new AbortController().signal,
+    )
+    assert.equal(result.ok, false, item.name)
+    if (result.ok) continue
+    assert.equal(result.reason.includes("raw"), false, item.name)
+    assert.equal(calls.length, 1, item.name)
+  }
+})
+
+function completionTextPart(text: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return { id: "part_text", type: "text", text, ...extra }
+}
+
+function completionUser(id = PROMPT, sessionID = CHILD): Record<string, unknown> {
+  return {
+    info: {
+      id,
+      sessionID,
+      role: "user",
+      time: { created: 1 },
+      agent: REVIEWER,
+      model: REVIEWER_MODEL,
+    },
+    parts: [completionTextPart("review request", { id: `${id}_text`, sessionID, messageID: id })],
+  }
+}
+
+function completionAssistant(options: {
+  id?: string
+  parentID?: string
+  sessionID?: string
+  completed?: number | null
+  error?: unknown
+  summary?: unknown
+  parts?: unknown[]
+} = {}): Record<string, unknown> {
+  const id = options.id ?? "msg_assistant"
+  const sessionID = options.sessionID ?? CHILD
+  const completed = options.completed === undefined ? 2 : options.completed
+  return {
+    info: {
+      id,
+      sessionID,
+      role: "assistant",
+      time: completed === null ? { created: 1 } : { created: 1, completed },
+      parentID: options.parentID ?? PROMPT,
+      modelID: REVIEWER_MODEL.modelID,
+      providerID: REVIEWER_MODEL.providerID,
+      mode: REVIEWER,
+      ...(options.error === undefined ? {} : { error: options.error }),
+      ...(options.summary === undefined ? {} : { summary: options.summary }),
+    },
+    parts: options.parts ?? [completionTextPart('{"decision":"keep"}')],
+  }
+}
+
+function runCompletion(
+  client: ReturnType<typeof fakeClient>["client"],
+  signal: AbortSignal = new AbortController().signal,
+) {
+  return readReviewCompletion(client, CHILD, PROMPT, signal)
+}
+
+test("review completion is pending without a completed response", async () => {
+  const empty = fakeClient({ messages: async () => ({ data: [] }) })
+  assert.deepEqual(await runCompletion(empty.client), { ok: true, value: { status: "pending" } })
+
+  const waiting = fakeClient({
+    messages: async () => ({
+      data: [
+        completionUser(),
+        completionAssistant({ completed: null, parts: [completionTextPart('{"decision":')] }),
+      ],
+    }),
+  })
+  assert.deepEqual(await runCompletion(waiting.client), { ok: true, value: { status: "pending" } })
+})
+
+test("review completion parses the whole visible text and ignores non-visible parts", async () => {
+  const controller = new AbortController()
+  const { client, calls } = fakeClient({
+    messages: async () => ({
+      data: [
+        completionUser(),
+        completionAssistant({
+          parts: [
+            { id: "part_start", type: "step-start" },
+            completionTextPart("{", { id: "part_open" }),
+            { id: "part_reason", type: "reasoning", text: '"reasoning":true,' },
+            completionTextPart('"decision":"keep"}', { id: "part_close" }),
+            completionTextPart("SYNTHETIC", { id: "part_synthetic", synthetic: true }),
+            completionTextPart("IGNORED", { id: "part_ignored", ignored: true }),
+            {
+              id: "part_finish",
+              type: "step-finish",
+              reason: "stop",
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+          ],
+        }),
+      ],
+    }),
+  })
+  const result = await runCompletion(client, controller.signal)
+  assert.deepEqual(result, { ok: true, value: { status: "complete", structured: { decision: "keep" } } })
+  assert.deepEqual(calls[0]?.options.path, { id: CHILD })
+  assert.equal(calls[0]?.options.signal, controller.signal)
+})
+
+test("review completion rejects malformed visible JSON without extracting a text part", async () => {
+  const { client } = fakeClient({
+    messages: async () => ({
+      data: [
+        completionUser(),
+        completionAssistant({
+          parts: [
+            completionTextPart('Here is the JSON: {"decision":"keep"}'),
+            completionTextPart(" and some prose"),
+          ],
+        }),
+      ],
+    }),
+  })
+  assert.deepEqual(await runCompletion(client), {
+    ok: true,
+    value: { status: "error", reason: "invalid-json" },
+  })
+})
+
+test("review completion rejects assistant errors, foreign prompts and foreign assistants", async () => {
+  const cases: Array<{ name: string; messages: unknown[]; reason: string }> = [
+    {
+      name: "assistant error",
+      messages: [
+        completionUser(),
+        completionAssistant({ error: { name: "UnknownError", data: { message: "raw provider" } } }),
+      ],
+      reason: "assistant-error",
+    },
+    {
+      name: "foreign prompt",
+      messages: [completionUser(), completionUser("msg_foreign"), completionAssistant()],
+      reason: "foreign-prompt",
+    },
+    {
+      name: "foreign assistant",
+      messages: [
+        completionUser(),
+        completionAssistant({ id: "msg_foreign", parentID: "msg_other" }),
+        completionAssistant(),
+      ],
+      reason: "foreign-message",
+    },
+  ]
+  for (const item of cases) {
+    const { client } = fakeClient({ messages: async () => ({ data: item.messages }) })
+    assert.deepEqual(
+      await runCompletion(client),
+      { ok: true, value: { status: "error", reason: item.reason } },
+      item.name,
+    )
+  }
+})
+
+test("review completion rejects completed tool-bearing and malformed responses", async () => {
+  const toolBearing = fakeClient({
+    messages: async () => ({
+      data: [
+        completionUser(),
+        completionAssistant({
+          parts: [
+            completionTextPart('{"decision":"keep"}'),
+            { id: "part_tool", type: "tool", tool: "bash", state: { status: "error" } },
+          ],
+        }),
+      ],
+    }),
+  })
+  assert.deepEqual(await runCompletion(toolBearing.client), {
+    ok: true,
+    value: { status: "error", reason: "tool-bearing" },
+  })
+
+  const malformed = fakeClient({
+    messages: async () => ({
+      data: [completionUser(), completionAssistant({ parts: [{ id: "part_bad", type: "text", text: 7 }] })],
+    }),
+  })
+  assert.deepEqual(await runCompletion(malformed.client), {
+    ok: true,
+    value: { status: "error", reason: "malformed-completion" },
+  })
+})
+
+test("review completion does not treat an incomplete tool step as completion", async () => {
+  const { client } = fakeClient({
+    messages: async () => ({
+      data: [
+        completionUser(),
+        completionAssistant({
+          completed: null,
+          parts: [{ id: "part_tool", type: "tool", tool: "bash", state: { status: "running" } }],
+        }),
+      ],
+    }),
+  })
+  assert.deepEqual(await runCompletion(client), { ok: true, value: { status: "pending" } })
+})
+
+test("review completion accepts compatible final duplicates and rejects incompatible ones", async () => {
+  const compatible = fakeClient({
+    messages: async () => ({
+      data: [
+        completionUser(),
+        completionAssistant({ id: "msg_a" }),
+        completionAssistant({ id: "msg_b" }),
+      ],
+    }),
+  })
+  assert.deepEqual(await runCompletion(compatible.client), {
+    ok: true,
+    value: { status: "complete", structured: { decision: "keep" } },
+  })
+
+  const incompatible = fakeClient({
+    messages: async () => ({
+      data: [
+        completionUser(),
+        completionAssistant({ id: "msg_a" }),
+        completionAssistant({ id: "msg_b", parts: [completionTextPart('{"decision":"rename"}')] }),
+      ],
+    }),
+  })
+  assert.deepEqual(await runCompletion(incompatible.client), {
+    ok: true,
+    value: { status: "error", reason: "incompatible-results" },
+  })
+})
+
+test("review completion sanitises read failures and malformed envelopes", async () => {
+  const cases: Array<{ name: string; handler: FakeHandlers["messages"] }> = [
+    { name: "server rejection", handler: async () => ({ error: { message: "raw read secret" } }) },
+    { name: "missing data", handler: async () => ({}) },
+    { name: "not an array", handler: async () => ({ data: { items: [] } }) },
+    {
+      name: "transport failure",
+      handler: async () => {
+        throw new Error("raw read throw")
+      },
+    },
+  ]
+  for (const item of cases) {
+    const { client } = fakeClient({ messages: item.handler })
+    const result = await runCompletion(client)
+    assert.equal(result.ok, false, item.name)
+    if (result.ok) continue
+    assert.equal(result.reason.includes("raw"), false, item.name)
+  }
+})
+
+test("stopReviewChild confirms only an accepted abort followed by idle status", async () => {
+  const controller = new AbortController()
+  const { client, calls } = fakeClient({
+    abort: async () => ({ data: true }),
+    status: async () => ({ data: { [CHILD]: { type: "idle" } } }),
+  })
+  const result = await stopReviewChild(client, CHILD, controller.signal)
+  assert.deepEqual(result, { ok: true, value: { confirmed: true } })
+  assert.deepEqual(calls.map((call) => call.method), ["abort", "status"])
+  assert.deepEqual(calls[0]?.options.path, { id: CHILD })
+  assert.equal(calls[0]?.options.signal, controller.signal)
+  assert.equal(calls[1]?.options.signal, controller.signal)
+})
+
+test("stopReviewChild reports unconfirmed on abort rejection without reading status", async () => {
+  const cases: Array<{ name: string; handler: FakeHandlers["abort"] }> = [
+    { name: "server rejection", handler: async () => ({ error: { message: "raw abort secret" } }) },
+    { name: "false acknowledgement", handler: async () => ({ data: false }) },
+    { name: "missing acknowledgement", handler: async () => ({}) },
+    {
+      name: "transport failure",
+      handler: async () => {
+        throw new Error("raw abort throw")
+      },
+    },
+  ]
+  for (const item of cases) {
+    const { client, calls } = fakeClient({ abort: item.handler })
+    const result = await stopReviewChild(client, CHILD, new AbortController().signal)
+    assert.deepEqual(result, { ok: true, value: { confirmed: false } }, item.name)
+    assert.deepEqual(calls.map((call) => call.method), ["abort"], item.name)
+  }
+})
+
+test("stopReviewChild reports unconfirmed when status is missing, unreadable or running", async () => {
+  const cases: Array<{ name: string; handler: FakeHandlers["status"] }> = [
+    { name: "missing entry", handler: async () => ({ data: {} }) },
+    { name: "busy", handler: async () => ({ data: { [CHILD]: { type: "busy" } } }) },
+    { name: "retry", handler: async () => ({ data: { [CHILD]: { type: "retry" } } }) },
+    { name: "missing data", handler: async () => ({}) },
+    { name: "not an object", handler: async () => ({ data: [] }) },
+    { name: "server rejection", handler: async () => ({ error: { message: "raw status secret" } }) },
+    {
+      name: "transport failure",
+      handler: async () => {
+        throw new Error("raw status throw")
+      },
+    },
+  ]
+  for (const item of cases) {
+    const { client } = fakeClient({
+      abort: async () => ({ data: true }),
+      status: item.handler,
+    })
+    const result = await stopReviewChild(client, CHILD, new AbortController().signal)
+    assert.deepEqual(result, { ok: true, value: { confirmed: false } }, item.name)
+  }
 })

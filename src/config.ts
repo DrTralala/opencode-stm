@@ -25,11 +25,22 @@ const PACKAGED_TEMPLATE_PATH = fileURLToPath(new URL("../../config.example.yaml"
 
 const CREATION_FAILED_REASON = "config: user configuration could not be created"
 
+export type ReviewerConfig = {
+  agent: string
+  timeoutSeconds: number
+  transcript: {
+    includeToolCalls: boolean
+    includeToolResults: boolean
+    maxBytes: number
+  }
+}
+
 export type ReviewConfig = {
   enabled: boolean
   intervalMessages: number
   maxReminders: number
   backoffMultiplier: number
+  reviewer?: ReviewerConfig
 }
 
 export type HistoricalConfig = {
@@ -70,7 +81,9 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 const TOP_KEYS = new Set(["review", "historical"])
-const REVIEW_KEYS = new Set(["enabled", "intervalMessages", "maxReminders", "backoffMultiplier"])
+const REVIEW_KEYS = new Set(["enabled", "intervalMessages", "maxReminders", "backoffMultiplier", "reviewer"])
+const REVIEWER_KEYS = new Set(["agent", "timeoutSeconds", "transcript"])
+const REVIEWER_TRANSCRIPT_KEYS = new Set(["includeToolCalls", "includeToolResults", "maxBytes"])
 const HISTORICAL_KEYS = new Set(["readTitles", "renameTitles", "readTranscript"])
 
 function findUnknownKey(input: Record<string, unknown>, allowed: ReadonlySet<string>, prefix: string): string | null {
@@ -143,6 +156,59 @@ export function parseConfigText(text: string): ConfigResult {
     review.intervalMessages = intervalMessages
     review.maxReminders = maxReminders
     review.backoffMultiplier = backoffMultiplier
+
+    if (raw.review.reviewer !== undefined) {
+      if (!isPlainObject(raw.review.reviewer)) return { ok: false, reason: "config: review.reviewer must be a mapping" }
+      const error = findUnknownKey(raw.review.reviewer, REVIEWER_KEYS, "review.reviewer.")
+      if (error !== null) return { ok: false, reason: error }
+      const rawAgent = raw.review.reviewer.agent
+      if (typeof rawAgent !== "string" || rawAgent.trim() === "") {
+        return { ok: false, reason: "config: review.reviewer.agent must be a non-empty string" }
+      }
+      const timeoutSeconds = readInteger(raw.review.reviewer, "timeoutSeconds", "review.reviewer.", 10, 600, 120)
+      if (typeof timeoutSeconds === "string") return { ok: false, reason: timeoutSeconds }
+
+      const transcript = { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 }
+      if (raw.review.reviewer.transcript !== undefined) {
+        if (!isPlainObject(raw.review.reviewer.transcript)) {
+          return { ok: false, reason: "config: review.reviewer.transcript must be a mapping" }
+        }
+        const transcriptError = findUnknownKey(
+          raw.review.reviewer.transcript,
+          REVIEWER_TRANSCRIPT_KEYS,
+          "review.reviewer.transcript.",
+        )
+        if (transcriptError !== null) return { ok: false, reason: transcriptError }
+        const includeToolCalls = readBoolean(
+          raw.review.reviewer.transcript,
+          "includeToolCalls",
+          "review.reviewer.transcript.",
+          transcript.includeToolCalls,
+        )
+        if (typeof includeToolCalls === "string") return { ok: false, reason: includeToolCalls }
+        const includeToolResults = readBoolean(
+          raw.review.reviewer.transcript,
+          "includeToolResults",
+          "review.reviewer.transcript.",
+          transcript.includeToolResults,
+        )
+        if (typeof includeToolResults === "string") return { ok: false, reason: includeToolResults }
+        const maxBytes = readInteger(
+          raw.review.reviewer.transcript,
+          "maxBytes",
+          "review.reviewer.transcript.",
+          4096,
+          1048576,
+          131072,
+        )
+        if (typeof maxBytes === "string") return { ok: false, reason: maxBytes }
+        transcript.includeToolCalls = includeToolCalls
+        transcript.includeToolResults = includeToolResults
+        transcript.maxBytes = maxBytes
+      }
+
+      review.reviewer = { agent: rawAgent.trim(), timeoutSeconds, transcript }
+    }
   }
 
   const historical: HistoricalConfig = { ...DEFAULT_CONFIG.historical }

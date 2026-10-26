@@ -7,6 +7,7 @@ import {
   hasPart,
   makeReminderPart,
   reminderText,
+  removeAnchorPart,
   singleSessionMessages,
 } from "../src/injection.js"
 import type { MutableMessage, MutablePart } from "../src/injection.js"
@@ -56,6 +57,62 @@ test("reminder text and part are deterministic", () => {
   assert.match(String(first.text), /rev-1/)
   assert.match(String(first.text), /ignore/i)
   assert.equal(reminderText("rev-1", 0), reminderText("rev-1", 0))
+})
+
+test("default reminder text is unchanged and background text delegates without user prompting", () => {
+  assert.equal(
+    reminderText("rev-1", 0),
+    `[opencode-stm] Title review rev-1 is due (reminder 1). Ask the user for one decision: keep the current title or rename it. Then call stm_title_review with decision "keep" or "rename" (rename also needs a new title) and expectedTitle equal to the current title. If this review is already resolved, ignore this reminder.`,
+  )
+  const background = reminderText("rev-1", 0, "background")
+  assert.match(background, /stm_title_review_start/)
+  assert.doesNotMatch(background, /Ask the user/)
+  assert.match(background, /continue/i)
+  assert.match(background, /active or resolved/i)
+  assert.match(background, /without polling/i)
+  assert.doesNotMatch(background, /stm_title_review with decision/)
+  assert.equal(makeReminderPart(anchor, "ses_1", "background").text, background)
+  assert.equal(makeReminderPart(anchor, "ses_1").text, reminderText("rev-1", 0))
+
+  const messages = [assistant("m2")]
+  assert.equal(ensureAnchorPart(messages, { ...anchor, anchorMessageID: "m2" }, "background"), "added")
+  assert.equal(messages[0]?.parts[1]?.text, background)
+})
+
+test("removeAnchorPart removes only the exact owned synthetic reminder", () => {
+  const owned: MutablePart = {
+    id: anchor.partID,
+    type: "text",
+    text: reminderText(anchor.reviewID, anchor.reminderIndex),
+    synthetic: true,
+    metadata: { "opencode-stm": { reviewID: anchor.reviewID, reminderIndex: anchor.reminderIndex } },
+  }
+  const toolPart: MutablePart = { id: "tool-1", type: "tool", tool: "bash", state: { status: "completed" } }
+  const userText: MutablePart = { id: "user-text", type: "text", text: "keep my text" }
+  const unrelated: MutablePart = {
+    id: "stm-reminder-other-0",
+    type: "text",
+    text: "other",
+    synthetic: true,
+    metadata: { "opencode-stm": { reviewID: "other", reminderIndex: 0 } },
+  }
+  const message: MutableMessage = {
+    info: { id: "m2", sessionID: "ses_1", role: "assistant" },
+    parts: [userText, toolPart, unrelated, owned],
+  }
+  const messages = [message]
+  assert.equal(removeAnchorPart(messages, { ...anchor, anchorMessageID: "absent" }), "anchor-missing")
+  assert.equal(removeAnchorPart(messages, anchor), "removed")
+  assert.deepEqual(message.parts.map((part) => part.id), ["user-text", "tool-1", "stm-reminder-other-0"])
+  assert.equal(removeAnchorPart(messages, anchor), "absent")
+
+  // A same-ID part that is not the owned synthetic reminder is never removed.
+  const forged: MutableMessage = {
+    info: { id: "m2", sessionID: "ses_1", role: "assistant" },
+    parts: [{ ...owned, synthetic: false }],
+  }
+  assert.equal(removeAnchorPart([forged], anchor), "absent")
+  assert.equal(forged.parts.length, 1)
 })
 
 const FRAME_BEGIN = "----- BEGIN OPENCODE-STM HISTORICAL TRANSCRIPT (UNTRUSTED) -----"

@@ -1,10 +1,14 @@
 import { createHash, randomUUID } from "node:crypto"
 import { chmodSync, closeSync, fchmodSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs"
 import { isAbsolute, join } from "node:path"
+import { isBackgroundAttempt, type BackgroundAttempt } from "./background-state.js"
 
-export const STATE_SCHEMA_VERSION = 1
+export const STATE_SCHEMA_VERSION = 2
+const LEGACY_STATE_SCHEMA_VERSION = 1
 export const FRONTIER_MAX = 64
 export const ANCHOR_MAX = 32
+const REMOVE_LOCK_RETRY_MS = 10
+const REMOVE_LOCK_ATTEMPTS = 50
 
 export type LockReason =
   | "none"
@@ -26,7 +30,7 @@ export type AnchorState = {
 }
 
 export type SessionMeta = {
-  schemaVersion: 1
+  schemaVersion: typeof STATE_SCHEMA_VERSION
   activity: number
   baselineMessageID: string | null
   frontier: string[]
@@ -35,6 +39,7 @@ export type SessionMeta = {
   locked: boolean
   lockReason: LockReason
   titleDigest: string | null
+  backgroundReview: BackgroundAttempt | null
 }
 
 export function initialMeta(): SessionMeta {
@@ -48,6 +53,7 @@ export function initialMeta(): SessionMeta {
     locked: false,
     lockReason: "none",
     titleDigest: null,
+    backgroundReview: null,
   }
 }
 
@@ -80,6 +86,10 @@ const LOCK_REASONS: readonly LockReason[] = [
 
 const META_KEYS = [
   "schemaVersion", "activity", "baselineMessageID", "frontier", "review", "anchors", "locked", "lockReason", "titleDigest",
+  "backgroundReview",
+] as const
+const LEGACY_META_KEYS = [
+  "schemaVersion", "activity", "baselineMessageID", "frontier", "review", "anchors", "locked", "lockReason", "titleDigest",
 ] as const
 const REVIEW_KEYS = ["id", "remindersSent", "nextTriggerAt"] as const
 const ANCHOR_KEYS = ["reviewID", "reminderIndex", "anchorMessageID", "partID", "obsolete"] as const
@@ -109,10 +119,9 @@ function isAnchorState(value: unknown): value is AnchorState {
   )
 }
 
-export function parseMeta(value: unknown): SessionMeta | null {
-  if (!isRecord(value)) return null
-  if (!hasOnlyKeys(value, META_KEYS)) return null
-  if (value.schemaVersion !== STATE_SCHEMA_VERSION) return null
+type BaseMeta = Omit<SessionMeta, "schemaVersion" | "backgroundReview">
+
+function parseBaseMeta(value: Record<string, unknown>): BaseMeta | null {
   if (!Number.isInteger(value.activity) || (value.activity as number) < 0) return null
   if (!(value.baselineMessageID === null || typeof value.baselineMessageID === "string")) return null
   if (!Array.isArray(value.frontier) || value.frontier.length > FRONTIER_MAX || !value.frontier.every((item) => typeof item === "string")) return null
@@ -121,18 +130,66 @@ export function parseMeta(value: unknown): SessionMeta | null {
   if (typeof value.locked !== "boolean") return null
   if (typeof value.lockReason !== "string" || !LOCK_REASONS.includes(value.lockReason as LockReason)) return null
   if (!(value.titleDigest === null || typeof value.titleDigest === "string")) return null
-  return value as SessionMeta
+  return {
+    activity: value.activity as number,
+    baselineMessageID: value.baselineMessageID as string | null,
+    frontier: value.frontier as string[],
+    review: value.review as ReviewState | null,
+    anchors: value.anchors as AnchorState[],
+    locked: value.locked as boolean,
+    lockReason: value.lockReason as LockReason,
+    titleDigest: value.titleDigest as string | null,
+  }
+}
+
+export function parseMeta(value: unknown): SessionMeta | null {
+  if (!isRecord(value)) return null
+  if (value.schemaVersion === LEGACY_STATE_SCHEMA_VERSION) {
+    if (!hasOnlyKeys(value, LEGACY_META_KEYS)) return null
+    const base = parseBaseMeta(value)
+    if (base === null) return null
+    return { ...base, schemaVersion: STATE_SCHEMA_VERSION, backgroundReview: null }
+  }
+  if (value.schemaVersion !== STATE_SCHEMA_VERSION) return null
+  if (!hasOnlyKeys(value, META_KEYS)) return null
+  const base = parseBaseMeta(value)
+  if (base === null) return null
+  if (!(value.backgroundReview === null || isBackgroundAttempt(value.backgroundReview))) return null
+  return {
+    ...base,
+    schemaVersion: STATE_SCHEMA_VERSION,
+    backgroundReview: value.backgroundReview as BackgroundAttempt | null,
+  }
 }
 
 export type LoadResult = { ok: true; value: SessionMeta | null } | { ok: false; reason: string }
 export type SaveResult = { ok: true } | { ok: false; reason: string }
 export type UpdateResult<T> = { ok: true; value: T } | { ok: false; reason: string }
+export type PresentUpdateResult<T> =
+  | { ok: true; present: true; value: T }
+  | { ok: true; present: false }
+  | { ok: false; reason: string }
 export type StateStoreOptions = { stateDir: string; now?: () => number }
 
 export interface StateStore {
   load(sessionID: string): Promise<LoadResult>
   save(sessionID: string, meta: SessionMeta): Promise<SaveResult>
   update<T>(sessionID: string, fn: (current: SessionMeta | null) => { next: SessionMeta; result: T }): Promise<UpdateResult<T>>
+  /**
+   * Apply the transition only when metadata exists at write time. The locked
+   * read and write do not synthesise a state object when the file is absent, so
+   * cleanup cannot publish fallback metadata after deletion. Returns
+   * `present: false` when metadata is absent.
+   */
+  updateIfPresent<T>(
+    sessionID: string,
+    fn: (current: SessionMeta) => { next: SessionMeta; result: T },
+  ): Promise<PresentUpdateResult<T>>
+  /**
+   * Best-effort lifecycle cleanup. Deletes only while holding the shared file
+   * lock. If the lock stays unavailable after bounded retries, metadata is left
+   * untouched; no lock owned by another process is reclaimed or unlinked.
+   */
   removeOwned(sessionID: string): Promise<void>
 }
 
@@ -232,12 +289,19 @@ export function createStateStore(options: StateStoreOptions): StateStore {
   }
 
   function writeUnlocked(sessionID: string, meta: SessionMeta): SaveResult {
+    // Every normal write passes the same strict parser used on load. This keeps
+    // arbitrary attempt values (for example an external failure-code string)
+    // from reaching disk and bricking the next load. Validate before creating
+    // any temporary file so a rejected write has no filesystem side effect.
+    const validated = parseMeta(meta)
+    if (validated === null) return { ok: false, reason: "state: invalid metadata" }
+
     const temp = paths(sessionID).temp()
     try {
       const fd = openSync(temp, "w", 0o600)
       try {
         fchmodSync(fd, 0o600)
-        writeSync(fd, `${JSON.stringify(meta)}\n`)
+        writeSync(fd, `${JSON.stringify(validated)}\n`)
         fsyncSync(fd)
       } finally {
         closeSync(fd)
@@ -303,12 +367,60 @@ export function createStateStore(options: StateStoreOptions): StateStore {
         }
       })
     },
+    updateIfPresent<T>(
+      sessionID: string,
+      fn: (current: SessionMeta) => { next: SessionMeta; result: T },
+    ): Promise<PresentUpdateResult<T>> {
+      return enqueue(sessionID, async () => {
+        try {
+          ensureDir()
+        } catch {
+          return { ok: false, reason: "state: directory unavailable" }
+        }
+        try {
+          return withFileLock<PresentUpdateResult<T>>(sessionID, () => {
+            const current = readUnlocked(sessionID)
+            if (!current.ok) return { ok: false, reason: current.reason }
+            if (current.value === null) return { ok: true, present: false }
+            const { next, result } = fn(current.value)
+            const saved = writeUnlocked(sessionID, next)
+            if (!saved.ok) return { ok: false, reason: saved.reason }
+            return { ok: true, present: true, value: result }
+          })
+        } catch (error) {
+          if (error instanceof StoreLockError) return { ok: false, reason: error.reason }
+          return { ok: false, reason: "state: failed" }
+        }
+      })
+    },
     async removeOwned(sessionID) {
-      try {
-        rmSync(paths(sessionID).file, { force: true })
-      } catch {
-        // Session lifecycle cleanup is best effort; stale metadata is allowed.
-      }
+      // Lifecycle cleanup is best effort: delete only while holding the shared
+      // lock, retry briefly for a live writer, then leave metadata in place if
+      // the lock remains unavailable. Callers revoke mutation authority
+      // separately, so retaining metadata is safer than deleting without the
+      // cross-process exclusion that protects readers and writers.
+      await enqueue(sessionID, async () => {
+        try {
+          ensureDir()
+        } catch {
+          return
+        }
+        for (let attempt = 0; attempt < REMOVE_LOCK_ATTEMPTS; attempt += 1) {
+          try {
+            withFileLock(sessionID, () => {
+              rmSync(paths(sessionID).file, { force: true })
+            })
+            return
+          } catch (error) {
+            if (!(error instanceof StoreLockError) || error.reason !== "state: lock contention") {
+              return
+            }
+            if (attempt + 1 < REMOVE_LOCK_ATTEMPTS) {
+              await new Promise<void>((resolve) => setTimeout(resolve, REMOVE_LOCK_RETRY_MS))
+            }
+          }
+        }
+      })
     },
   }
 }

@@ -12,7 +12,7 @@ import { createOperationGuard, createStateStore, hashSessionID, hashTitle, initi
 import { lockManually } from "../src/scheduler.js"
 import { createRootCache } from "../src/sdk.js"
 import { createTranscriptPager } from "../src/transcript.js"
-import { createCurrentTools, type StmServices } from "../src/tools.js"
+import { createBackgroundTools, createCurrentTools, type StmServices } from "../src/tools.js"
 import type { MutableMessage, MutablePart } from "../src/injection.js"
 import { fakeClient, type FakeHandler } from "./fakes.js"
 
@@ -102,6 +102,37 @@ function pendingReviewMeta(digest = hashTitle(DEFAULT_TITLE)) {
   }
 }
 
+function activeMeta(digest = hashTitle(DEFAULT_TITLE)) {
+  return {
+    ...pendingReviewMeta(digest),
+    backgroundReview: {
+      id: "attempt-1",
+      reviewID: "rev-1",
+      ownerID: "owner-1",
+      phase: "active" as const,
+      titleDigest: digest,
+      cutoffMessageID: "msg_dispatch",
+      activityAtDispatch: 30,
+      deadline: 120000,
+      childSessionID: "ses_child",
+      promptMessageID: "msg_prompt",
+      stop: "pending" as const,
+      failureCode: null,
+    },
+  }
+}
+
+function reviewerStub(overrides: Record<string, unknown> = {}) {
+  return {
+    start: async () => ({ status: "queued" as const }),
+    onEvent: async () => {},
+    reconcile: async () => {},
+    cancel: async () => {},
+    dispose: async () => {},
+    ...overrides,
+  }
+}
+
 async function transcriptServices() {
   const { services, stateDir } = makeServices({
     messages: async () => ({
@@ -153,6 +184,53 @@ test("plugin startup creates a missing configuration and exposes only current-se
   const configPath = join(configHome, "opencode", "opencode-stm", "config.yaml")
   assert.equal(readFileSync(configPath, "utf8"), readFileSync(new URL("../../config.example.yaml", import.meta.url), "utf8"))
   assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), ["stm_title_lock", "stm_title_read", "stm_title_review"])
+})
+
+test("reviewer configuration adds only the dispatch tool", async () => {
+  const configHome = track(mkdtempSync(join(tmpdir(), "stm-cfg-")))
+  const configDir = join(configHome, "opencode", "opencode-stm")
+  mkdirSync(configDir, { recursive: true })
+  writeFileSync(join(configDir, "config.yaml"), "review:\n  reviewer:\n    agent: title-worker\n")
+  const hooks = await createStm({ client: fakeClient({}).client } as unknown as PluginInput, {
+    env: { XDG_CONFIG_HOME: configHome, XDG_STATE_HOME: track(mkdtempSync(join(tmpdir(), "stm-state-"))) },
+    home: configHome,
+  })
+  assert.deepEqual(Object.keys(hooks.tool ?? {}).sort(), [
+    "stm_title_lock",
+    "stm_title_read",
+    "stm_title_review",
+    "stm_title_review_start",
+  ])
+})
+
+test("dispatch tools are absent without a coordinator and serialise a compact status", async () => {
+  const { services } = makeServices()
+  assert.deepEqual(createBackgroundTools(services), {})
+
+  const calls: unknown[] = []
+  services.backgroundReviewer = {
+    ...reviewerStub(),
+    start: async (args: unknown, context: unknown) => {
+      calls.push({ args, context })
+      return { status: "queued" as const }
+    },
+  }
+  const tools = createBackgroundTools(services)
+  assert.deepEqual(Object.keys(tools), ["stm_title_review_start"])
+  assert.deepEqual(Object.keys(tools.stm_title_review_start!.args).sort(), [
+    "expectedTitle",
+    "retry",
+    "reviewID",
+  ])
+  const output = await tools.stm_title_review_start!.execute(
+    { reviewID: "rev-1", expectedTitle: DEFAULT_TITLE, retry: true },
+    toolContext("msg_dispatch") as any,
+  )
+  assert.deepEqual(JSON.parse(String(output)), { plugin: "opencode-stm", status: "queued" })
+  assert.equal((calls[0] as any).args.reviewID, "rev-1")
+  assert.equal((calls[0] as any).args.expectedTitle, DEFAULT_TITLE)
+  assert.equal((calls[0] as any).args.retry, true)
+  assert.equal((calls[0] as any).context.messageID, "msg_dispatch")
 })
 
 test("creation failure exposes no tools or hooks and emits one safe diagnostic", async () => {
@@ -226,6 +304,156 @@ test("transform never replaces output.messages and ignores child sessions", asyn
   const childMessages = [user("c1")]
   await childTransform({}, { messages: childMessages } as any)
   assert.equal(childMessages[0]?.parts.length, 1)
+})
+
+test("reviewer mode injects background dispatch wording while default mode is unchanged", async () => {
+  const { services } = makeServices()
+  services.config = {
+    ...DEFAULT_CONFIG,
+    review: { ...DEFAULT_CONFIG.review, reviewer: { agent: "worker", timeoutSeconds: 120, transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 } } },
+  }
+  await services.state.save("ses_1", pendingReviewMeta())
+  services.roots.remember("ses_1", true)
+  const messages: MutableMessage[] = [user("m1")]
+  await createTransform(services)({}, { messages } as any)
+  const reminder = messages
+    .flatMap((message) => message.parts)
+    .find((part) => part.id === "stm-reminder-rev-1-0")
+  assert.ok(reminder, "pending review reminder was injected")
+  assert.match(String(reminder.text), /stm_title_review_start/)
+  assert.doesNotMatch(String(reminder.text), /Ask the user/)
+})
+
+test("an active background attempt removes only its owned replay part and retains persisted anchors", async () => {
+  const { services, stateDir } = makeServices()
+  services.config = {
+    ...DEFAULT_CONFIG,
+    review: {
+      ...DEFAULT_CONFIG.review,
+      reviewer: { agent: "worker", timeoutSeconds: 120, transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 } },
+    },
+  }
+  await services.state.save("ses_1", activeMeta())
+  services.roots.remember("ses_1", true)
+
+  const activePart: MutablePart = {
+    id: "stm-reminder-rev-1-0",
+    type: "text",
+    text: "old active reminder",
+    synthetic: true,
+    metadata: { "opencode-stm": { reviewID: "rev-1", reminderIndex: 0 } },
+  }
+  const unrelatedPart: MutablePart = {
+    id: "stm-reminder-old-0",
+    type: "text",
+    text: "historical reminder",
+    synthetic: true,
+    metadata: { "opencode-stm": { reviewID: "old", reminderIndex: 0 } },
+  }
+  const toolPart: MutablePart = { id: "tool-1", type: "tool", tool: "bash", state: { status: "completed" } }
+  const messages: MutableMessage[] = [{
+    info: { id: "m1", sessionID: "ses_1", role: "assistant" },
+    parts: [{ id: "m1-text", type: "text", text: "parent work" }, toolPart, unrelatedPart, activePart],
+  }]
+
+  await createTransform(services)({}, { messages } as any)
+
+  const ids = messages[0]?.parts.map((part) => part.id)
+  assert.equal(ids?.includes("stm-reminder-rev-1-0"), false)
+  assert.equal(ids?.includes("stm-reminder-old-0"), true)
+  assert.equal(ids?.includes("tool-1"), true)
+  assert.equal(messages[0]?.parts[0]?.text, "parent work")
+  const state = readState(stateDir)
+  assert.deepEqual(state.anchors.map((anchor: any) => anchor.partID), ["stm-reminder-rev-1-0"])
+
+  // Once the attempt is gone, the retained anchor replays as historical
+  // context; suppression never deleted it from persisted state.
+  await services.state.update("ses_1", (current) => ({
+    next: { ...current!, backgroundReview: null },
+    result: null,
+  }))
+  await createTransform(services)({}, { messages } as any)
+  const restored = messages[0]?.parts.find((part) => part.id === "stm-reminder-rev-1-0")
+  assert.ok(restored, "retained anchor replays after completion")
+  assert.match(String(restored.text), /stm_title_review_start/)
+})
+
+test("without reviewer mode a persisted active attempt still produces the default reminder", async () => {
+  const { services, stateDir } = makeServices()
+  await services.state.save("ses_1", activeMeta())
+  services.roots.remember("ses_1", true)
+
+  const messages: MutableMessage[] = [user("m1")]
+  await createTransform(services)({}, { messages } as any)
+  const reminder = messages
+    .flatMap((message) => message.parts)
+    .find((part) => part.id === "stm-reminder-rev-1-0")
+  assert.ok(reminder, "orphaned active attempt did not suppress the default reminder")
+  assert.match(String(reminder.text), /Ask the user/)
+  assert.doesNotMatch(String(reminder.text), /stm_title_review_start/)
+  assert.deepEqual(
+    readState(stateDir).anchors.map((anchor: any) => anchor.partID),
+    ["stm-reminder-rev-1-0"],
+  )
+})
+
+test("without reviewer mode a reused active anchor is not removed", async () => {
+  const { services } = makeServices()
+  await services.state.save("ses_1", activeMeta())
+  services.roots.remember("ses_1", true)
+  const activePart: MutablePart = {
+    id: "stm-reminder-rev-1-0",
+    type: "text",
+    text: "legacy reminder",
+    synthetic: true,
+    metadata: { "opencode-stm": { reviewID: "rev-1", reminderIndex: 0 } },
+  }
+  const messages: MutableMessage[] = [{
+    info: { id: "m1", sessionID: "ses_1", role: "user" },
+    parts: [{ id: "m1-text", type: "text", text: "parent work" }, activePart],
+  }]
+
+  await createTransform(services)({}, { messages } as any)
+  assert.equal(messages[0]?.parts.some((part) => part.id === "stm-reminder-rev-1-0"), true)
+  assert.equal(messages[0]?.parts[0]?.text, "parent work")
+})
+
+test("root activity starts lazy reconciliation without holding the transform", async () => {
+  const { services } = makeServices()
+  let release: () => void = () => {}
+  const reconciled: string[] = []
+  services.backgroundReviewer = reviewerStub({
+    reconcile: async (parentID: string) => {
+      reconciled.push(parentID)
+      await new Promise<void>((resolve) => {
+        release = resolve
+      })
+    },
+  })
+  const messages: MutableMessage[] = [user("m1")]
+  await createTransform(services)({}, { messages } as any)
+  assert.deepEqual(reconciled, ["ses_1"])
+  release()
+
+  const child = makeServices({ get: async (options: any) => ({ data: { id: options.path.id, title: DEFAULT_TITLE, parentID: "ses_parent" } }) })
+  const childReconciled: string[] = []
+  child.services.backgroundReviewer = reviewerStub({
+    reconcile: async (parentID: string) => {
+      childReconciled.push(parentID)
+    },
+  })
+  await createTransform(child.services)({}, { messages: [user("c1")] } as any)
+  assert.deepEqual(childReconciled, [])
+})
+
+test("a child transform creates no review state", async () => {
+  const { services, stateDir } = makeServices({
+    get: async (options: any) => ({ data: { id: options.path.id, title: DEFAULT_TITLE, parentID: "ses_parent" } }),
+  })
+  const messages: MutableMessage[] = [user("c1")]
+  await createTransform(services)({}, { messages } as any)
+  assert.deepEqual(readdirSync(stateDir), [])
+  assert.equal(messages[0]?.parts.length, 1)
 })
 
 test("an external title change locks and stops further automatic injections", async () => {
@@ -382,6 +610,29 @@ test("session.deleted removes only the hashed state file", async () => {
   assert.equal(existsSync(join(stateDir, `${hashSessionID("ses_2")}.json`)), true)
   assert.equal(services.blocked.has("ses_1"), false)
   assert.equal(services.blocked.get("ses_other")?.size ?? 0, 0)
+})
+
+test("lifecycle events reach the coordinator before deletion cleanup", async () => {
+  const { services, stateDir } = makeServices()
+  await services.state.save("ses_1", initialMeta())
+  const seen: Array<{ event: string; statePresent: boolean }> = []
+  services.backgroundReviewer = reviewerStub({
+    onEvent: async (event: any) => {
+      seen.push({
+        event: event.type,
+        statePresent: existsSync(join(stateDir, `${hashSessionID("ses_1")}.json`)),
+      })
+    },
+  })
+  const hook = createEventHook(services)
+  await hook({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } } as any)
+  assert.deepEqual(seen, [{ event: "session.idle", statePresent: true }])
+  await hook({ event: { type: "session.deleted", properties: { info: { id: "ses_1" } } } } as any)
+  assert.deepEqual(seen, [
+    { event: "session.idle", statePresent: true },
+    { event: "session.deleted", statePresent: true },
+  ])
+  assert.equal(existsSync(join(stateDir, `${hashSessionID("ses_1")}.json`)), false)
 })
 
 test("transform during a summary request rebaselines without counting", async () => {
