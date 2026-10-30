@@ -55,7 +55,7 @@ export type StmConfig = {
 }
 
 export const DEFAULT_CONFIG: Readonly<StmConfig> = Object.freeze({
-  review: Object.freeze<ReviewConfig>({ enabled: true, intervalMessages: 20, maxReminders: 3, backoffMultiplier: 2 }),
+  review: Object.freeze<ReviewConfig>({ enabled: false, intervalMessages: 20, maxReminders: 3, backoffMultiplier: 2 }),
   historical: Object.freeze<HistoricalConfig>({ readTitles: false, renameTitles: false, readTranscript: false }),
 })
 

@@ -76,7 +76,7 @@ On first plugin startup, a missing configuration file is created automatically f
 
 ```yaml
 review:
-  enabled: true
+  enabled: false
   intervalMessages: 20
   maxReminders: 3
   backoffMultiplier: 2
@@ -95,7 +95,7 @@ historical:
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `review.enabled` | `true` | Periodic title reviews for root sessions |
+| `review.enabled` | `false` | Periodic title reviews for root sessions |
 | `review.intervalMessages` | `20` | Eligible messages before the first reminder |
 | `review.maxReminders` | `3` | Maximum reminders per review |
 | `review.backoffMultiplier` | `2` | Multiplier between reminder thresholds |
@@ -108,6 +108,8 @@ historical:
 | `historical.readTitles` | `false` | Exposes `stm_history_title_read` |
 | `historical.renameTitles` | `false` | Exposes `stm_history_title_rename` |
 | `historical.readTranscript` | `false` | Exposes `stm_history_transcript` and `stm_history_review_end` |
+
+Periodic reviews are disabled both in generated configurations and when `review.enabled` is omitted, including in empty files. Set `review.enabled: true` to opt in; an existing explicit `true` remains enabled. Manual current-session title tools remain available.
 
 Startup bootstrap behaviour:
 
@@ -127,7 +129,7 @@ Configuration is read once at startup; restart OpenCode after any change. Tool d
 
 ### Background title reviewer (opt-in)
 
-Setting `review.reviewer` exposes `stm_title_review_start` and changes due reminders to ask the main agent to dispatch the pending review and continue its task. The reviewer is an ordinary OpenCode agent defined in the normal configuration; STM does not create, modify or install it:
+Setting `review.reviewer` exposes `stm_title_review_start` and changes due reminders to ask the main agent to dispatch the pending review and continue its task. Reviews must also be enabled with `review.enabled: true`. The reviewer is an ordinary OpenCode agent defined in the normal configuration; STM does not create, modify or install it:
 
 ```json
 {

@@ -37,6 +37,7 @@ function observedOf(messages: MutableMessage[]) {
 
 const REVIEWER_CONFIG = {
   ...DEFAULT_CONFIG.review,
+  enabled: true,
   reviewer: {
     agent: "worker",
     timeoutSeconds: 120,
@@ -100,7 +101,7 @@ test("eligibility follows the design matrix", () => {
 })
 
 test("default thresholds open at 20 and anchor reminders at 60 and 140", () => {
-  const config = DEFAULT_CONFIG.review
+  const config = { ...DEFAULT_CONFIG.review, enabled: true }
   let meta = initialMeta()
   const deps = { newId: () => "rev-1" }
   const history: MutableMessage[] = [user("m1")]
@@ -196,7 +197,7 @@ test("an unseen summary message rebaselines and preserves review budget", () => 
 })
 
 test("locked metadata suppresses reviews and reminders but still counts activity", () => {
-  const config = DEFAULT_CONFIG.review
+  const config = { ...DEFAULT_CONFIG.review, enabled: true }
   const deps = { newId: () => "rev-1" }
   let meta = firstObservation(true, "digest-1")
   meta = observe(meta, observedOf([user("m0")]), config, deps).meta
@@ -314,7 +315,7 @@ test("anchor marked obsolete when its message is absent", () => {
 })
 
 test("next threshold still anchors after an obsolete anchor", () => {
-  const config = DEFAULT_CONFIG.review
+  const config = { ...DEFAULT_CONFIG.review, enabled: true }
   const deps = { newId: () => "rev-1" }
   let meta = firstObservation(true, "digest-1")
   meta = {
@@ -350,7 +351,7 @@ test("frontier cap keeps newest 64", () => {
 })
 
 test("custom backoff 3 produces 20/80/260", () => {
-  const config = { ...DEFAULT_CONFIG.review, backoffMultiplier: 3 }
+  const config = { ...DEFAULT_CONFIG.review, enabled: true, backoffMultiplier: 3 }
   const deps = { newId: () => "rev-1" }
   let meta = initialMeta()
   const history: MutableMessage[] = [user("m0")]
@@ -394,7 +395,7 @@ test("manual lock preserves the title digest", () => {
 })
 
 test("unlock discards the pending review so the next review gets a fresh id", () => {
-  const config = DEFAULT_CONFIG.review
+  const config = { ...DEFAULT_CONFIG.review, enabled: true }
   let meta = firstObservation(true, "digest-1")
   const history: MutableMessage[] = [user("m1")]
   meta = observe(meta, observedOf(history), config, { newId: () => "rev-1" }).meta
@@ -417,7 +418,7 @@ test("unlock discards the pending review so the next review gets a fresh id", ()
 })
 
 test("an initial jump past thresholds catches up one reminder per observation", () => {
-  const config = DEFAULT_CONFIG.review
+  const config = { ...DEFAULT_CONFIG.review, enabled: true }
   const deps = { newId: () => "rev-1" }
   let meta = firstObservation(true, "digest-1")
   const history: MutableMessage[] = [user("m1")]
@@ -458,7 +459,7 @@ test("an initial jump past thresholds catches up one reminder per observation", 
 })
 
 test("a jump after the first reminder catches up one reminder per observation", () => {
-  const config = DEFAULT_CONFIG.review
+  const config = { ...DEFAULT_CONFIG.review, enabled: true }
   const deps = { newId: () => "rev-1" }
   let meta = firstObservation(true, "digest-1")
   const history: MutableMessage[] = [user("m1")]
@@ -519,7 +520,7 @@ test("an active background review suppresses a new review while counting", () =>
 })
 
 test("an orphaned active attempt does not suppress default-mode reminders", () => {
-  const config = DEFAULT_CONFIG.review
+  const config = { ...DEFAULT_CONFIG.review, enabled: true }
   let meta = firstObservation(true, "digest-1")
   meta = observe(meta, observedOf([user("m1")]), config, { newId: () => "rev-1" }).meta
   meta = {
@@ -536,7 +537,7 @@ test("an orphaned active attempt does not suppress default-mode reminders", () =
 })
 
 test("an orphaned active attempt does not block a fresh default-mode review", () => {
-  const config = DEFAULT_CONFIG.review
+  const config = { ...DEFAULT_CONFIG.review, enabled: true }
   let meta = firstObservation(true, "digest-1")
   meta = observe(meta, observedOf([user("m1")]), config, { newId: () => "rev-1" }).meta
   meta = { ...meta, activity: 19, backgroundReview: backgroundAttempt() }
@@ -642,7 +643,7 @@ test("explicit resolution clears an uncertain record only when its stop is confi
 })
 
 test("a custom-backoff jump keeps configured cumulative thresholds", () => {
-  const config = { ...DEFAULT_CONFIG.review, backoffMultiplier: 3 }
+  const config = { ...DEFAULT_CONFIG.review, enabled: true, backoffMultiplier: 3 }
   const deps = { newId: () => "rev-1" }
   let meta = firstObservation(true, "digest-1")
   const history: MutableMessage[] = [user("m1")]

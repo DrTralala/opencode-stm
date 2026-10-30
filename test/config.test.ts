@@ -87,7 +87,7 @@ test("existing empty configuration is preserved unchanged", () => {
   mkdirSync(join(path, ".."), { recursive: true })
   writeFileSync(path, "")
   const result = loadConfig({}, home)
-  assert.deepEqual(result, { ok: true, config: DEFAULT_CONFIG, path })
+  assert.deepEqual(result, { ok: true, config: TEMPLATE_CONFIG, path })
   assert.equal(readFileSync(path, "utf8"), "")
 })
 
@@ -109,7 +109,7 @@ test("partial file fills omitted fields from defaults", () => {
   assert.equal(result.ok, true)
   if (!result.ok) return
   assert.equal(result.config.review.intervalMessages, 50)
-  assert.equal(result.config.review.enabled, true)
+  assert.equal(result.config.review.enabled, false)
   assert.equal(result.config.review.maxReminders, DEFAULT_CONFIG.review.maxReminders)
   assert.equal(result.config.historical.readTranscript, false)
 })
@@ -117,6 +117,24 @@ test("partial file fills omitted fields from defaults", () => {
 test("config.example.yaml disables title reviews and historical access", () => {
   const text = readFileSync(new URL("../../config.example.yaml", import.meta.url), "utf8")
   assert.deepEqual(parseConfigText(text), { ok: true, config: TEMPLATE_CONFIG, path: null })
+  assert.deepEqual(parseConfigText(text), parseConfigText(""))
+})
+
+test("omitted review settings leave title reviews and historical access disabled", () => {
+  for (const text of ["", "# nothing\n", "{}", "review: {}", "historical: {}"]) {
+    assert.deepEqual(parseConfigText(text), { ok: true, config: TEMPLATE_CONFIG, path: null }, text)
+  }
+})
+
+test("explicit review enablement overrides the disabled default", () => {
+  for (const enabled of [true, false]) {
+    const result = parseConfigText(`review:\n  enabled: ${enabled}\n`)
+    assert.deepEqual(result, {
+      ok: true,
+      config: { ...TEMPLATE_CONFIG, review: { ...TEMPLATE_CONFIG.review, enabled } },
+      path: null,
+    })
+  }
 })
 
 test("reviewer is opt-in and nested defaults are independent", () => {
@@ -384,11 +402,11 @@ test("XDG path resolution ignores unset, empty and relative values", () => {
 })
 
 test("empty file returns defaults", () => {
-  assert.deepEqual(parseConfigText(""), { ok: true, config: DEFAULT_CONFIG, path: null })
+  assert.deepEqual(parseConfigText(""), { ok: true, config: TEMPLATE_CONFIG, path: null })
 })
 
 test("comments-only file returns defaults", () => {
-  assert.deepEqual(parseConfigText("# nothing\n"), { ok: true, config: DEFAULT_CONFIG, path: null })
+  assert.deepEqual(parseConfigText("# nothing\n"), { ok: true, config: TEMPLATE_CONFIG, path: null })
 })
 
 test("unknown top-level key rejected", () => {
@@ -492,13 +510,13 @@ test("mutating a defaulted result does not change later results or the exported 
   const empty = parseConfigText("")
   assert.equal(empty.ok, true)
   if (!empty.ok) return
-  empty.config.review.enabled = false
+  empty.config.review.enabled = true
   empty.config.historical.readTitles = true
 
   const laterPartial = parseConfigText("review:\n  intervalMessages: 50\n")
   assert.equal(laterPartial.ok, true)
   if (!laterPartial.ok) return
-  assert.equal(laterPartial.config.review.enabled, true)
+  assert.equal(laterPartial.config.review.enabled, false)
   assert.equal(laterPartial.config.review.maxReminders, 3)
   assert.equal(laterPartial.config.historical.readTranscript, false)
   assert.equal(laterPartial.config.historical.readTitles, false)
@@ -507,7 +525,7 @@ test("mutating a defaulted result does not change later results or the exported 
   const laterMissing = loadConfig({}, laterHome)
   assert.deepEqual(laterMissing, { ok: true, config: TEMPLATE_CONFIG, path: resolveConfigPath({}, laterHome) })
 
-  assert.equal(DEFAULT_CONFIG.review.enabled, true)
+  assert.equal(DEFAULT_CONFIG.review.enabled, false)
   assert.equal(DEFAULT_CONFIG.review.maxReminders, 3)
   assert.equal(DEFAULT_CONFIG.review.backoffMultiplier, 2)
   assert.equal(DEFAULT_CONFIG.historical.readTitles, false)
@@ -523,12 +541,12 @@ test("exported defaults are deeply frozen", () => {
     historical: { readTranscript: boolean }
   }
   assert.throws(() => {
-    writable.review.enabled = false
+    writable.review.enabled = true
   })
   assert.throws(() => {
     writable.historical.readTranscript = true
   })
-  assert.equal(DEFAULT_CONFIG.review.enabled, true)
+  assert.equal(DEFAULT_CONFIG.review.enabled, false)
   assert.equal(DEFAULT_CONFIG.historical.readTranscript, false)
 })
 

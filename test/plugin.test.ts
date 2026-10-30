@@ -43,7 +43,7 @@ function makeServices(handlers: { get?: FakeHandler; update?: FakeHandler; messa
   })
   const services: StmServices = {
     client,
-    config: DEFAULT_CONFIG,
+    config: { ...DEFAULT_CONFIG, review: { ...DEFAULT_CONFIG.review, enabled: true } },
     state: createStateStore({ stateDir }),
     transcripts: createTranscriptPager(),
     roots: createRootCache(client),
@@ -258,6 +258,22 @@ test("creation failure exposes no tools or hooks and emits one safe diagnostic",
   }
 })
 
+test("default configuration does not inject title reviews after the activity threshold", async () => {
+  const { services, stateDir } = makeServices()
+  services.config = DEFAULT_CONFIG
+  const transform = createTransform(services)
+  const messages: MutableMessage[] = [user("m1")]
+  await transform({}, { messages } as any)
+  for (let index = 2; index <= 26; index += 1) messages.push(user(`m${index}`))
+  await transform({}, { messages } as any)
+
+  const state = readState(stateDir)
+  assert.equal(state.activity, 25)
+  assert.equal(state.review, null)
+  assert.deepEqual(state.anchors, [])
+  assert.equal(messages.some((message) => message.parts.some((part) => part.synthetic === true)), false)
+})
+
 test("transform baselines the first observation and injects a reminder at the threshold in place", async () => {
   const { services, stateDir } = makeServices()
   const transform = createTransform(services)
@@ -310,7 +326,7 @@ test("reviewer mode injects background dispatch wording while default mode is un
   const { services } = makeServices()
   services.config = {
     ...DEFAULT_CONFIG,
-    review: { ...DEFAULT_CONFIG.review, reviewer: { agent: "worker", timeoutSeconds: 120, transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 } } },
+    review: { ...DEFAULT_CONFIG.review, enabled: true, reviewer: { agent: "worker", timeoutSeconds: 120, transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 } } },
   }
   await services.state.save("ses_1", pendingReviewMeta())
   services.roots.remember("ses_1", true)
@@ -330,6 +346,7 @@ test("an active background attempt removes only its owned replay part and retain
     ...DEFAULT_CONFIG,
     review: {
       ...DEFAULT_CONFIG.review,
+      enabled: true,
       reviewer: { agent: "worker", timeoutSeconds: 120, transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 } },
     },
   }
