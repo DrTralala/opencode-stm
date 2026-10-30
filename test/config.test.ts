@@ -28,6 +28,10 @@ import {
 } from "../src/config.js"
 
 const createdDirs: string[] = []
+const TEMPLATE_CONFIG = {
+  review: { enabled: false, intervalMessages: 20, maxReminders: 3, backoffMultiplier: 2 },
+  historical: { readTitles: false, renameTitles: false, readTranscript: false },
+}
 
 after(() => {
   for (const dir of createdDirs) rmSync(dir, { recursive: true, force: true })
@@ -47,7 +51,7 @@ test("missing file is generated from the packaged template", () => {
   const home = tempDir()
   const path = resolveConfigPath({}, home)
   const result = loadConfig({}, home)
-  assert.deepEqual(result, { ok: true, config: DEFAULT_CONFIG, path })
+  assert.deepEqual(result, { ok: true, config: TEMPLATE_CONFIG, path })
   assert.equal(readFileSync(path, "utf8"), readFileSync(new URL("../../config.example.yaml", import.meta.url), "utf8"))
 })
 
@@ -56,7 +60,7 @@ test("missing configuration is generated under an absolute XDG_CONFIG_HOME", () 
   const env = { XDG_CONFIG_HOME: tempDir() }
   const path = resolveConfigPath(env, home)
   const result = loadConfig(env, home)
-  assert.deepEqual(result, { ok: true, config: DEFAULT_CONFIG, path })
+  assert.deepEqual(result, { ok: true, config: TEMPLATE_CONFIG, path })
   assert.equal(readFileSync(path, "utf8"), exampleTemplate())
 })
 
@@ -110,9 +114,9 @@ test("partial file fills omitted fields from defaults", () => {
   assert.equal(result.config.historical.readTranscript, false)
 })
 
-test("config.example.yaml parses to exactly the defaults", () => {
+test("config.example.yaml disables title reviews and historical access", () => {
   const text = readFileSync(new URL("../../config.example.yaml", import.meta.url), "utf8")
-  assert.deepEqual(parseConfigText(text), { ok: true, config: DEFAULT_CONFIG, path: null })
+  assert.deepEqual(parseConfigText(text), { ok: true, config: TEMPLATE_CONFIG, path: null })
 })
 
 test("reviewer is opt-in and nested defaults are independent", () => {
@@ -481,7 +485,7 @@ test("mutating a defaulted result does not change later results or the exported 
   const missing = loadConfig({}, tempDir())
   assert.equal(missing.ok, true)
   if (!missing.ok) return
-  missing.config.review.enabled = false
+  missing.config.review.enabled = true
   missing.config.review.maxReminders = 99
   missing.config.historical.readTranscript = true
 
@@ -501,7 +505,7 @@ test("mutating a defaulted result does not change later results or the exported 
 
   const laterHome = tempDir()
   const laterMissing = loadConfig({}, laterHome)
-  assert.deepEqual(laterMissing, { ok: true, config: DEFAULT_CONFIG, path: resolveConfigPath({}, laterHome) })
+  assert.deepEqual(laterMissing, { ok: true, config: TEMPLATE_CONFIG, path: resolveConfigPath({}, laterHome) })
 
   assert.equal(DEFAULT_CONFIG.review.enabled, true)
   assert.equal(DEFAULT_CONFIG.review.maxReminders, 3)
@@ -567,7 +571,7 @@ test("deleting the configuration regenerates it on the next startup", () => {
   assert.equal(loadConfig({}, home).ok, true)
   rmSync(path)
   const result = loadConfig({}, home)
-  assert.deepEqual(result, { ok: true, config: DEFAULT_CONFIG, path })
+  assert.deepEqual(result, { ok: true, config: TEMPLATE_CONFIG, path })
   assert.equal(readFileSync(path, "utf8"), exampleTemplate())
 })
 

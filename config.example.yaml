@@ -1,4 +1,4 @@
-# opencode-stm example configuration. All active values shown are the built-in defaults.
+# opencode-stm example configuration. Title reviews and historical access are disabled.
 # When this file is missing at plugin startup, opencode-stm creates it here from
 # this template. Existing files are never overwritten; restart OpenCode after
 # editing. The destination is $XDG_CONFIG_HOME/opencode/opencode-stm/config.yaml
@@ -10,7 +10,7 @@
 # flag requires explicit user configuration plus the normal OpenCode permission
 # policy. These flags do not grant authorisation by themselves.
 review:
-  enabled: true
+  enabled: false
   intervalMessages: 20
   maxReminders: 3
   backoffMultiplier: 2
