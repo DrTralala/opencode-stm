@@ -110,6 +110,12 @@ test("stm_title_read establishes a baseline and returns bounded status", async (
   assert.equal(result.title, DEFAULT_TITLE)
   assert.equal(result.locked, false)
   assert.equal(result.reviewID, null)
+  assert.equal(result.canRename, true)
+  assert.match(result.guidance, /advisory/i)
+  assert.match(tools.stm_title_review!.description, /read.*first/i)
+  assert.match(tools.stm_title_review!.description, /authoris|authoriz/i)
+  assert.match(tools.stm_title_lock!.description, /current-session renames/i)
+  assert.match(tools.stm_title_lock!.description, /clears.*review ID/i)
   assert.equal(readState(dir, "ses_1").titleDigest, hashTitle(DEFAULT_TITLE))
 })
 
@@ -284,6 +290,8 @@ test("denied permission and pre-aborted calls perform no SDK write", async () =>
     denied,
   )
   assert.equal(deniedResult.status, "denied")
+  assert.match(deniedResult.guidance, /stop/i)
+  assert.match(deniedResult.guidance, /do not retry/i)
   assert.equal(calls.filter((call) => call.method === "update").length, 0)
   assert.equal(calls.length, callsAtDeny)
 
@@ -334,6 +342,13 @@ test("locked sessions reject rename but still allow keep and read", async () => 
   )
   assert.equal(rename.status, "conflict")
   assert.equal(rename.reason, "locked")
+  assert.equal(rename.lockReason, "manual")
+  assert.equal(rename.renamed, false)
+  assert.equal(rename.canRename, false)
+  assert.match(rename.guidance, /authoris|authoriz/i)
+  assert.match(rename.guidance, /re-read|reread/i)
+  assert.match(rename.guidance, /fresh/i)
+  assert.match(rename.guidance, /automatic.*never unlock/i)
   const keep = await execute(tools, "stm_title_review", { decision: "keep", expectedTitle: DEFAULT_TITLE }, context())
   assert.equal(keep.status, "ok")
 })
@@ -504,10 +519,168 @@ test("external digest mismatch locks and returns locked", async () => {
   )
   assert.equal(result.status, "locked")
   assert.equal(result.reason, "external-title-change")
+  assert.equal(result.lockReason, "external")
+  assert.equal(result.renamed, false)
+  assert.equal(result.canRename, false)
+  assert.match(result.guidance, /fresh/i)
   assert.equal(ctx.asks.length, 0)
   const state = readState(dir, "ses_1")
   assert.equal(state.locked, true)
   assert.equal(state.lockReason, "external")
+})
+
+test("title read reconciles an external title change under the guard and cancels background work afterwards", async () => {
+  const { services, calls, dir, setTitle } = makeServices()
+  setTitle("Changed externally")
+  await services.state.save("ses_1", {
+    ...initialMeta(),
+    activity: 20,
+    review: { id: "rev-1", remindersSent: 1, nextTriggerAt: 60 },
+    titleDigest: hashTitle(DEFAULT_TITLE),
+    backgroundReview: {
+      id: "attempt-1",
+      reviewID: "rev-1",
+      ownerID: "owner-1",
+      phase: "active",
+      titleDigest: hashTitle(DEFAULT_TITLE),
+      cutoffMessageID: "msg_dispatch",
+      activityAtDispatch: 20,
+      deadline: 120000,
+      childSessionID: "ses_child",
+      promptMessageID: "msg_prompt",
+      stop: "pending",
+      failureCode: null,
+    },
+  })
+  const originalGuard = services.guard
+  let inGuard = false
+  services.guard = {
+    run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+      return originalGuard.run(key, async () => {
+        inGuard = true
+        try {
+          return await fn()
+        } finally {
+          inGuard = false
+        }
+      })
+    },
+  }
+  const cancellations: Array<{ parentID: string; reason: string; inGuard: boolean }> = []
+  services.backgroundReviewer = {
+    start: async () => ({ status: "queued" as const }),
+    onEvent: async () => {},
+    reconcile: async () => {},
+    cancel: async (parentID: string, reason: string) => {
+      cancellations.push({ parentID, reason, inGuard })
+    },
+    dispose: async () => {},
+  }
+
+  const tools = createCurrentTools(services)
+  const result = await execute(tools, "stm_title_read", {}, context())
+  assert.equal(result.status, "ok")
+  assert.equal(result.title, "Changed externally")
+  assert.equal(result.locked, true)
+  assert.equal(result.lockReason, "external")
+  assert.equal(result.canRename, false)
+  assert.equal(result.reviewID, "rev-1")
+  assert.match(result.guidance, /locked/i)
+  assert.deepEqual(cancellations, [{
+    parentID: "ses_1",
+    reason: "external-title-change",
+    inGuard: false,
+  }])
+  assert.equal(readState(dir, "ses_1").backgroundReview.failureCode, "background-revoked")
+  assert.equal(calls.filter((call) => call.method === "update").length, 0)
+})
+
+test("title read external reconciliation preserves a concurrent manual lock", async () => {
+  let gets = 0
+  const readSeen = deferred()
+  const readRelease = deferred()
+  const { services, dir } = makeServices({
+    get: async (options: any) => {
+      gets += 1
+      if (gets === 2) {
+        readSeen.resolve()
+        await readRelease.promise
+      }
+      return { data: { id: options.path.id, title: "Changed externally" } }
+    },
+  })
+  await services.state.save("ses_1", { ...initialMeta(), titleDigest: hashTitle(DEFAULT_TITLE) })
+  const tools = createCurrentTools(services)
+  const readPromise = execute(tools, "stm_title_read", {}, context())
+  await readSeen.promise
+  const locked = await services.state.update("ses_1", (current) => ({
+    next: { ...(current ?? initialMeta()), locked: true, lockReason: "manual" },
+    result: true,
+  }))
+  assert.equal(locked.ok, true)
+  readRelease.resolve()
+  const result = await readPromise
+  assert.equal(result.status, "ok")
+  assert.equal(result.locked, true)
+  assert.equal(result.lockReason, "manual")
+  assert.equal(result.canRename, false)
+  const state = readState(dir, "ses_1")
+  assert.equal(state.locked, true)
+  assert.equal(state.lockReason, "manual")
+})
+
+test("title read does not relock when an unlock establishes the live digest during its read", async () => {
+  let gets = 0
+  const readSeen = deferred()
+  const readRelease = deferred()
+  const { services, dir } = makeServices({
+    get: async (options: any) => {
+      gets += 1
+      if (gets === 2) {
+        readSeen.resolve()
+        await readRelease.promise
+      }
+      return { data: { id: options.path.id, title: "Current Title" } }
+    },
+  })
+  await services.state.save("ses_1", {
+    ...initialMeta(),
+    locked: true,
+    lockReason: "external",
+    titleDigest: hashTitle("Old Title"),
+  })
+  const tools = createCurrentTools(services)
+  const readPromise = execute(tools, "stm_title_read", {}, context())
+  await readSeen.promise
+  const unlocked = await services.state.update("ses_1", (current) => ({
+    next: unlock(current ?? initialMeta(), hashTitle("Current Title")),
+    result: true,
+  }))
+  assert.equal(unlocked.ok, true)
+  readRelease.resolve()
+  const result = await readPromise
+  assert.equal(result.status, "ok")
+  assert.equal(result.locked, false)
+  assert.equal(result.lockReason, "none")
+  assert.equal(result.canRename, true)
+  const state = readState(dir, "ses_1")
+  assert.equal(state.locked, false)
+  assert.equal(state.titleDigest, hashTitle("Current Title"))
+})
+
+test("title read fails closed when live title or state verification fails", async () => {
+  const titleFailure = makeServices({ get: async () => ({ error: "unavailable" }) })
+  titleFailure.services.roots.remember("ses_1", true)
+  const titleResult = await execute(createCurrentTools(titleFailure.services), "stm_title_read", {}, context())
+  assert.equal(titleResult.status, "error")
+  assert.equal("canRename" in titleResult, false)
+
+  const stateFailure = makeServices()
+  stateFailure.services.roots.remember("ses_1", true)
+  stateFailure.services.state.update = async () => ({ ok: false, reason: "state: unavailable" }) as any
+  const stateResult = await execute(createCurrentTools(stateFailure.services), "stm_title_read", {}, context())
+  assert.equal(stateResult.status, "state-unavailable")
+  assert.equal("canRename" in stateResult, false)
 })
 
 test("update .error returns error and keeps the review", async () => {
@@ -599,6 +772,80 @@ test("lock writes manual lock and unlock resets activity and digest", async () =
   assert.equal(state.review, null)
 })
 
+test("authorised unlock requires re-read and a fresh rename without the cleared review ID", async () => {
+  const { services, calls, dir } = makeServices()
+  await services.state.save("ses_1", {
+    ...initialMeta(),
+    activity: 42,
+    baselineMessageID: "m42",
+    locked: true,
+    lockReason: "manual",
+    review: { id: "rev-stale", remindersSent: 1, nextTriggerAt: 60 },
+    titleDigest: hashTitle(DEFAULT_TITLE),
+  })
+  const tools = createCurrentTools(services)
+  const unlocked = await execute(
+    tools,
+    "stm_title_lock",
+    { locked: false, expectedTitle: DEFAULT_TITLE },
+    context(),
+  )
+  assert.equal(unlocked.status, "ok")
+
+  const reread = await execute(tools, "stm_title_read", {}, context())
+  assert.equal(reread.status, "ok")
+  assert.equal(reread.locked, false)
+  assert.equal(reread.canRename, true)
+  assert.equal(reread.reviewID, null)
+
+  const stale = await execute(
+    tools,
+    "stm_title_review",
+    { decision: "rename", expectedTitle: DEFAULT_TITLE, title: "Fresh title", reviewID: "rev-stale" },
+    context(),
+  )
+  assert.equal(stale.status, "conflict")
+  assert.equal(stale.reason, "stale-review")
+  assert.equal(calls.filter((call) => call.method === "update").length, 0)
+
+  const fresh = await execute(
+    tools,
+    "stm_title_review",
+    { decision: "rename", expectedTitle: DEFAULT_TITLE, title: "Fresh title" },
+    context(),
+  )
+  assert.equal(fresh.status, "ok")
+  assert.equal(fresh.title, "Fresh title")
+  assert.equal(calls.filter((call) => call.method === "update").length, 1)
+  assert.equal(readState(dir, "ses_1").locked, false)
+})
+
+test("denied unlock stops without changing lock state or writing a title", async () => {
+  const { services, calls, dir } = makeServices()
+  await services.state.save("ses_1", {
+    ...initialMeta(),
+    locked: true,
+    lockReason: "manual",
+    titleDigest: hashTitle(DEFAULT_TITLE),
+  })
+  const tools = createCurrentTools(services)
+  const denied = context()
+  denied.ask = async () => {
+    throw new Error("denied")
+  }
+  const result = await execute(
+    tools,
+    "stm_title_lock",
+    { locked: false, expectedTitle: DEFAULT_TITLE },
+    denied,
+  )
+  assert.equal(result.status, "denied")
+  assert.match(result.guidance, /stop/i)
+  assert.match(result.guidance, /do not retry/i)
+  assert.equal(calls.filter((call) => call.method === "update").length, 0)
+  assert.equal(readState(dir, "ses_1").locked, true)
+})
+
 test("lock expectedTitle mismatch conflicts without state change", async () => {
   const { services, calls, dir } = makeServices()
   await services.state.save("ses_1", {
@@ -626,6 +873,7 @@ test("title read truncation is flagged beyond 200 code points", async () => {
   assert.equal([...result.title].length, 201)
   assert.equal(result.title.endsWith("…"), true)
   assert.equal(result.locked, true)
+  assert.equal(result.canRename, false)
   assert.equal(result.lockReason, "non-default-title")
 })
 
@@ -700,6 +948,10 @@ test("a manual lock during a pending rename ask blocks the rename write", async 
   const result = await renamePromise
   assert.equal(result.status, "conflict")
   assert.equal(result.reason, "locked")
+  assert.equal(result.lockReason, "manual")
+  assert.equal(result.renamed, false)
+  assert.equal(result.canRename, false)
+  assert.match(result.guidance, /authoris|authoriz/i)
   assert.equal(calls.filter((call) => call.method === "update").length, 0)
   const state = readState(dir, "ses_1")
   assert.equal(state.locked, true)

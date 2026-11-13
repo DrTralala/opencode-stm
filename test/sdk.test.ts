@@ -304,6 +304,29 @@ const PROMPT = "msg_prompt"
 const CALLER = "build"
 const REVIEWER = "title-worker"
 const REVIEWER_MODEL = { providerID: "probe", modelID: "reviewer" }
+const PROVIDER_CATALOG = {
+  all: [
+    { id: "probe", models: { reviewer: { id: "reviewer" }, "nested/model": { id: "nested/model" } } },
+    { id: "parent-provider", models: { "parent-model": { id: "parent-model" } } },
+    { id: "user-provider", models: { "user-model": { id: "user-model" } } },
+  ],
+  connected: ["probe", "parent-provider", "user-provider"],
+  default: {},
+}
+
+type ProviderListHandler = (input?: { signal?: AbortSignal }) => Promise<{ data?: unknown; error?: unknown }>
+
+function setProviderList(client: ReturnType<typeof fakeClient>["client"], list: ProviderListHandler): void {
+  const target = client as unknown as { provider: { list: ProviderListHandler } }
+  target.provider = { list }
+}
+
+function ensureProviderList(client: ReturnType<typeof fakeClient>["client"]): void {
+  const target = client as unknown as { provider?: { list: ProviderListHandler } }
+  if (target.provider === undefined) {
+    setProviderList(client, async () => ({ data: PROVIDER_CATALOG }))
+  }
+}
 
 function agentFixture(name: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -341,9 +364,11 @@ function runContext(
     messageID: string
     callerAgent: string
     reviewerAgent: string
+    model: string
   }> = {},
   signal: AbortSignal = new AbortController().signal,
 ) {
+  ensureProviderList(client)
   return readReviewExecutionContext(
     client,
     {
@@ -357,7 +382,7 @@ function runContext(
   )
 }
 
-test("review context uses the configured reviewer model and carries only parent restrictions", async () => {
+test("review context inherits the dispatch model instead of an external reviewer model", async () => {
   const controller = new AbortController()
   const { client, calls } = fakeClient({
     agents: async () => ({
@@ -386,12 +411,13 @@ test("review context uses the configured reviewer model and carries only parent 
   assert.equal(result.ok, true)
   if (!result.ok) return
   assert.deepEqual(result.value, {
-    agent: { name: REVIEWER, model: REVIEWER_MODEL, variant: "high" },
+    agent: { name: REVIEWER, model: { providerID: "parent-provider", modelID: "parent-model" } },
     childPermissions: [
       { permission: "bash", pattern: "*", action: "deny" },
       { permission: "webfetch", pattern: "*", action: "ask" },
       { permission: "*", pattern: "*", action: "deny" },
     ],
+    dispatchParentID: "msg_user",
   })
   assert.deepEqual(calls.map((call) => call.method), ["agents", "message", "get"])
   assert.equal(calls[0]?.options.signal, controller.signal)
@@ -406,7 +432,7 @@ test("review context falls back to the dispatch assistant model instead of the s
     agents: async () => ({
       data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER)],
     }),
-    message: async () => ({ data: dispatchFixture() }),
+    message: async () => ({ data: dispatchFixture({ variant: "parent-variant" }) }),
     get: async () => ({
       data: {
         id: PARENT,
@@ -421,13 +447,100 @@ test("review context falls back to the dispatch assistant model instead of the s
   assert.deepEqual(result.value.agent, {
     name: REVIEWER,
     model: { providerID: "parent-provider", modelID: "parent-model" },
+    variant: "parent-variant",
   })
+  assert.equal(result.value.dispatchParentID, "msg_user")
   assert.deepEqual(result.value.childPermissions, [
     { permission: "*", pattern: "*", action: "deny" },
   ])
 })
 
-test("review context reads the dispatch user message model shape when no agent model is configured", async () => {
+test("review context uses an explicit configured model exactly and does not inherit another variant", async () => {
+  const controller = new AbortController()
+  let providerCalls = 0
+  let providerSignal: AbortSignal | undefined
+  const { client } = fakeClient({
+    agents: async () => ({ data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER, {
+      model: REVIEWER_MODEL,
+      variant: "external-variant",
+    })] }),
+    message: async () => ({ data: dispatchFixture({ variant: "parent-variant" }) }),
+    get: async () => ({ data: { id: PARENT, title: "Parent" } }),
+  })
+  setProviderList(client, async (input) => {
+    providerCalls += 1
+    providerSignal = input?.signal
+    return { data: PROVIDER_CATALOG }
+  })
+
+  const result = await runContext(client, { model: "probe/nested/model" }, controller.signal)
+
+  assert.equal(result.ok, true)
+  if (result.ok) {
+    assert.deepEqual(result.value.agent, {
+      name: REVIEWER,
+      model: { providerID: "probe", modelID: "nested/model" },
+    })
+    assert.equal(result.value.dispatchParentID, "msg_user")
+  }
+  assert.equal(providerCalls, 1)
+  assert.equal(providerSignal, controller.signal)
+})
+
+test("review context rejects malformed or unavailable explicit models without falling back", async () => {
+  const cases: Array<{
+    name: string
+    model: string
+    catalog?: unknown
+    failure?: "returned" | "thrown"
+  }> = [
+    { name: "malformed model setting", model: "probe/ nested/model", catalog: PROVIDER_CATALOG },
+    { name: "missing exact model", model: "probe/not-in-catalog", catalog: PROVIDER_CATALOG },
+    {
+      name: "disconnected provider",
+      model: "probe/nested/model",
+      catalog: { ...PROVIDER_CATALOG, connected: ["parent-provider", "user-provider"] },
+    },
+    { name: "malformed catalogue", model: "probe/nested/model", catalog: { all: [], connected: "probe" } },
+    { name: "provider catalogue rejection", model: "probe/nested/model", failure: "returned" },
+    { name: "provider catalogue transport failure", model: "probe/nested/model", failure: "thrown" },
+  ]
+
+  for (const item of cases) {
+    const { client, calls } = fakeClient({
+      agents: async () => ({ data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER, {
+        model: REVIEWER_MODEL,
+        variant: "external-variant",
+      })] }),
+      message: async () => ({ data: dispatchFixture({ variant: "parent-variant" }) }),
+      get: async () => ({ data: { id: PARENT, title: "Parent" } }),
+    })
+    let providerCalls = 0
+    setProviderList(client, async () => {
+      providerCalls += 1
+      if (item.failure === "returned") return { error: { message: "raw provider catalogue secret" } }
+      if (item.failure === "thrown") throw new Error("raw provider transport detail")
+      return { data: item.catalog }
+    })
+
+    const result = await runContext(client, { model: item.model })
+
+    assert.equal(result.ok, false, item.name)
+    if (!result.ok) {
+      assert.match(result.reason, /review\.reviewer\.model/, item.name)
+      assert.equal(result.reason.includes("not-in-catalog"), false, item.name)
+      assert.equal(result.reason.includes("raw"), false, item.name)
+    }
+    assert.equal(providerCalls, item.name === "malformed model setting" ? 0 : 1, item.name)
+    assert.deepEqual(
+      calls.map((call) => call.method),
+      item.name === "malformed model setting" ? [] : ["agents", "message"],
+      item.name,
+    )
+  }
+})
+
+test("review context rejects user messages as dispatches", async () => {
   const { client } = fakeClient({
     agents: async () => ({ data: [agentFixture(REVIEWER)] }),
     message: async () => ({
@@ -445,9 +558,7 @@ test("review context reads the dispatch user message model shape when no agent m
     get: async () => ({ data: { id: PARENT, title: "Parent" } }),
   })
   const result = await runContext(client, { callerAgent: REVIEWER })
-  assert.equal(result.ok, true)
-  if (!result.ok) return
-  assert.deepEqual(result.value.agent.model, { providerID: "user-provider", modelID: "user-model" })
+  assert.equal(result.ok, false)
 })
 
 test("review context rejects disabled, missing and primary-only agents", async () => {
@@ -535,21 +646,35 @@ test("review context rejects malformed agent, dispatch and permission data", asy
     {
       name: "dispatch id mismatch",
       handlers: {
-        agents: async () => ({ data: [agentFixture(REVIEWER)] }),
+        agents: async () => ({ data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER)] }),
         message: async () => ({ data: dispatchFixture({ id: "msg_other" }) }),
       },
     },
     {
       name: "dispatch session mismatch",
       handlers: {
-        agents: async () => ({ data: [agentFixture(REVIEWER)] }),
+        agents: async () => ({ data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER)] }),
         message: async () => ({ data: dispatchFixture({ sessionID: "ses_other" }) }),
+      },
+    },
+    {
+      name: "dispatch is not an assistant",
+      handlers: {
+        agents: async () => ({ data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER)] }),
+        message: async () => ({ data: dispatchFixture({ role: "user" }) }),
+      },
+    },
+    {
+      name: "dispatch parent is missing",
+      handlers: {
+        agents: async () => ({ data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER)] }),
+        message: async () => ({ data: dispatchFixture({ parentID: undefined }) }),
       },
     },
     {
       name: "permission not an array",
       handlers: {
-        agents: async () => ({ data: [agentFixture(REVIEWER)] }),
+        agents: async () => ({ data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER)] }),
         message: async () => ({ data: dispatchFixture() }),
         get: async () => ({ data: { id: PARENT, title: "Parent", permission: "deny" } }),
       },
@@ -557,7 +682,7 @@ test("review context rejects malformed agent, dispatch and permission data", asy
     {
       name: "permission action invalid",
       handlers: {
-        agents: async () => ({ data: [agentFixture(REVIEWER)] }),
+        agents: async () => ({ data: [agentFixture(CALLER, { mode: "primary" }), agentFixture(REVIEWER)] }),
         message: async () => ({ data: dispatchFixture() }),
         get: async () => ({
           data: {

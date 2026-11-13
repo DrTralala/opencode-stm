@@ -8,6 +8,8 @@ import type { Hooks, Plugin, PluginInput, PluginModule, ToolDefinition } from "@
 import { loadConfig } from "./config.js"
 import { createBackgroundReviewer } from "./background-review.js"
 import { ensureAnchorPart, removeAnchorPart, singleSessionMessages, type MutableMessage, type ReminderMode } from "./injection.js"
+import { createReviewSnapshots } from "./review-input.js"
+import { registerReviewerAgent } from "./reviewer-agent.js"
 import { applyBackgroundDecision, parseReviewDecision } from "./review-apply.js"
 import {
   anchorPartID,
@@ -33,16 +35,48 @@ type InjectionPlan = {
   activeReviewID: string | null
 } | null
 
-function injectAnchors(messages: MutableMessage[], plan: InjectionPlan, mode: ReminderMode): void {
+function injectAnchors(messages: MutableMessage[], plan: InjectionPlan, mode: ReminderMode, contextID?: string): void {
   if (plan === null || plan.locked) return
   for (const anchor of plan.anchors) {
     if (mode === "background" && plan.activeReviewID !== null && anchor.reviewID === plan.activeReviewID) {
       removeAnchorPart(messages, anchor)
       continue
     }
-    if (anchor.obsolete) continue
-    ensureAnchorPart(messages, anchor, mode)
+    if (anchor.obsolete) {
+      if (mode === "background") removeAnchorPart(messages, anchor)
+      continue
+    }
+    if (mode === "background" && contextID === undefined) {
+      removeAnchorPart(messages, anchor)
+      continue
+    }
+    ensureAnchorPart(messages, anchor, mode, contextID)
   }
+}
+
+function injectWithReviewContext(
+  services: StmServices,
+  sessionID: string,
+  messages: MutableMessage[],
+  plan: InjectionPlan,
+  mode: ReminderMode,
+): void {
+  let contextID: string | undefined
+  const needsContext =
+    mode === "background" &&
+    services.config.review.enabled &&
+    plan !== null &&
+    !plan.locked &&
+    plan.anchors.some(
+      (anchor) =>
+        !anchor.obsolete &&
+        !(plan.activeReviewID !== null && anchor.reviewID === plan.activeReviewID),
+    )
+  if (needsContext && services.reviewSnapshots !== undefined) {
+    const captured = services.reviewSnapshots.capture(sessionID, messages)
+    if (captured.ok) contextID = captured.value.contextID
+  }
+  injectAnchors(messages, plan, mode, contextID)
 }
 
 // Drop an anchor the observation just created (and any review created with it):
@@ -72,14 +106,16 @@ export function createTransform(
     const root = await services.roots.isRoot(sessionID)
     if (!root.ok || !root.value) return
 
+    const reminderMode: ReminderMode = services.config.review.reviewer === undefined ? "main" : "background"
+    if (reminderMode === "background") services.reviewSnapshots?.discard(sessionID)
+
     // Root activity is also a lazy recovery point for stored background work.
     // Never await model work or a remote stop here.
     if (services.backgroundReviewer !== undefined) void services.backgroundReviewer.reconcile(sessionID)
 
-    // Transcript retrieval returns its bounded result directly from the tool
-    // call; the transform only owns title-review reminder injection.
+    // Historical transcript retrieval returns directly from its tool. This
+    // transform owns reminders and the background reviewer's retained snapshot.
 
-    const reminderMode: ReminderMode = services.config.review.reviewer === undefined ? "main" : "background"
     const loaded = await services.state.load(sessionID)
     if (!loaded.ok) return
     let fallback = loaded.value
@@ -126,7 +162,7 @@ export function createTransform(
         }
       })
       if (!saved.ok) return
-      injectAnchors(single.messages, saved.value, reminderMode)
+      injectWithReviewContext(services, sessionID, single.messages, saved.value, reminderMode)
       return
     }
 
@@ -173,13 +209,30 @@ export function createTransform(
       },
     )
     if (!outcome.ok) return
-    injectAnchors(single.messages, outcome.plan, reminderMode)
+    injectWithReviewContext(services, sessionID, single.messages, outcome.plan, reminderMode)
   }
 }
 
 export function createEventHook(services: StmServices): NonNullable<Hooks["event"]> {
   return async (input) => {
     const event = input.event
+    const lifecycle = event as unknown as {
+      type?: unknown
+      properties?: { sessionID?: unknown; status?: { type?: unknown } }
+    }
+    const idleSessionID =
+      lifecycle.type === "session.idle" || lifecycle.type === "session.error"
+        ? lifecycle.properties?.sessionID
+        : lifecycle.type === "session.status" && lifecycle.properties?.status?.type === "idle"
+          ? lifecycle.properties.sessionID
+          : undefined
+    if (typeof idleSessionID === "string" && idleSessionID.length > 0) {
+      services.reviewSnapshots?.discard(idleSessionID)
+    }
+    if (event.type === "session.deleted") {
+      const id = (event.properties.info as { id?: unknown } | undefined)?.id
+      if (typeof id === "string" && id.length > 0) services.reviewSnapshots?.discard(id)
+    }
     // Forward first so an owned deletion revokes mutation authority and stops a
     // known child before the historical cleanup below removes its metadata.
     if (services.backgroundReviewer !== undefined) await services.backgroundReviewer.onEvent(event)
@@ -217,6 +270,7 @@ export async function createStm(input: PluginInput, runtime: StmRuntime = {}): P
     config: loaded.config,
     state: createStateStore({ stateDir: resolveStateDir(env, home), now }),
     transcripts: createTranscriptPager(),
+    reviewSnapshots: createReviewSnapshots(),
     roots: createRootCache(input.client),
     guard: createOperationGuard(),
     blocked: new Map(),
@@ -248,11 +302,16 @@ export async function createStm(input: PluginInput, runtime: StmRuntime = {}): P
     ...createBackgroundTools(services),
   }
   return {
+    config: async (config) => {
+      const reviewer = loaded.config.review.reviewer
+      if (reviewer !== undefined) registerReviewerAgent(config, reviewer)
+    },
     tool: tools,
     "experimental.chat.messages.transform": createTransform(services),
     event: createEventHook(services),
     dispose: async () => {
       // Revoke and stop background work before releasing the caches it uses.
+      services.reviewSnapshots?.clear()
       await services.backgroundReviewer?.dispose()
       services.transcripts.dispose()
       services.roots.clear()

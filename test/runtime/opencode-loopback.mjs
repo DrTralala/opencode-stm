@@ -47,6 +47,8 @@ const BACKGROUND_LOCK_MARKER = "STM_BACKGROUND_LOCK_PROBE"
 const BACKGROUND_SEED_MARKER = "STM_BACKGROUND_SEED_PROBE"
 const BACKGROUND_DISPATCH_MARKER = "STM_BACKGROUND_DISPATCH_PROBE"
 const BACKGROUND_CONTINUE_MARKER = "STM_BACKGROUND_CONTINUE_PROBE"
+const BACKGROUND_REVIEW_ORIGINAL_MARKER = "STM_BACKGROUND_REVIEW_ORIGINAL_HISTORY_PROBE"
+const BACKGROUND_REVIEW_SUMMARY_MARKER = "STM_BACKGROUND_REVIEW_RETAINED_SUMMARY_PROBE"
 const BACKGROUND_REVIEW_PROMPT = "OpenCode STM background title review."
 const BACKGROUND_TOOL = "stm_title_review_start"
 const BACKGROUND_UNLOCK_TOOL = "stm_title_lock"
@@ -244,6 +246,7 @@ class ProviderMock {
     this.backgroundDuplicateServed = false
     this.backgroundReviewID = null
     this.backgroundExpectedTitle = null
+    this.backgroundContextID = null
   }
 
   async start() {
@@ -284,7 +287,13 @@ class ProviderMock {
     for await (const chunk of req) raw += chunk
 
     if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-      writeJson(res, { object: "list", data: [{ id: "mock", object: "model" }] })
+      writeJson(res, {
+        object: "list",
+        data: [
+          { id: "mock", object: "model" },
+          { id: "reviewer", object: "model" },
+        ],
+      })
       return
     }
     if (req.method !== "POST" || !url.pathname.endsWith("/chat/completions")) {
@@ -352,7 +361,10 @@ class ProviderMock {
       toolChoice: body.tool_choice ?? null,
       hasToolResult: toolResultAfterMarker,
       containsReviewReminder: /Title review \S+ is due/.test(allText),
+      reviewContextID: /contextID\s+"([^"]+)"/.exec(allText)?.[1] ?? null,
       containsReviewFrame: allText.includes("BEGIN OPENCODE-STM REVIEW TRANSCRIPT"),
+      containsOriginalHistoryMarker: allText.includes(BACKGROUND_REVIEW_ORIGINAL_MARKER),
+      containsRetainedSummaryMarker: allText.includes(BACKGROUND_REVIEW_SUMMARY_MARKER),
       containsContinueMarker: allText.includes(BACKGROUND_CONTINUE_MARKER),
       containsSeedMarker: allText.includes(BACKGROUND_SEED_MARKER),
       containsToolCallRecord: allText.includes('"kind":"tool-call"'),
@@ -437,6 +449,7 @@ class ProviderMock {
 
     if (kind === "background-dispatch") {
       const reviewID = /Title review (\S+) is due/.exec(marker)?.[1] ?? null
+      const contextID = receipt.reviewContextID ?? this.backgroundContextID
       const encoded = /EXPECTED_TITLE_B64=([A-Za-z0-9+/=]+)/.exec(marker)?.[1] ?? null
       let expectedTitle = null
       if (encoded !== null) {
@@ -448,14 +461,16 @@ class ProviderMock {
       }
       if (reviewID !== null) this.backgroundReviewID = reviewID
       if (expectedTitle !== null) this.backgroundExpectedTitle = expectedTitle
+      if (receipt.reviewContextID !== null) this.backgroundContextID = receipt.reviewContextID
       const resolvedReviewID = reviewID ?? this.backgroundReviewID
       const resolvedTitle = expectedTitle ?? this.backgroundExpectedTitle
       receipt.reviewID = resolvedReviewID
       receipt.expectedTitle = resolvedTitle
+      receipt.reviewContextID = contextID
       const duplicate = this.options.duplicateDispatch === true && toolResultAfterMarker && !this.backgroundDuplicateServed
       if (!toolResultAfterMarker || duplicate) {
         if (duplicate) this.backgroundDuplicateServed = true
-        if (resolvedReviewID === null || resolvedTitle === null) {
+        if (resolvedReviewID === null || resolvedTitle === null || contextID === null) {
           receipt.response = "background-dispatch-missing-arguments"
           writeSse(res, body, { text: "BACKGROUND_DISPATCH_ARGUMENTS_MISSING" })
           return
@@ -465,7 +480,7 @@ class ProviderMock {
           toolCall: {
             kind: "background-dispatch",
             name: BACKGROUND_TOOL,
-            arguments: { reviewID: resolvedReviewID, expectedTitle: resolvedTitle },
+            arguments: { reviewID: resolvedReviewID, expectedTitle: resolvedTitle, contextID },
           },
         })
         return
@@ -1283,6 +1298,29 @@ export default {
 `
 }
 
+function retainedSummaryFixtureSource() {
+  return `// Isolated test fixture: rewrite only one outgoing history marker before STM's transform hook.
+const original = ${JSON.stringify(BACKGROUND_REVIEW_ORIGINAL_MARKER)}
+const summary = ${JSON.stringify(BACKGROUND_REVIEW_SUMMARY_MARKER)}
+export default {
+  id: "stm-retained-summary-fixture",
+  async server() {
+    return {
+      "experimental.chat.messages.transform": async (_input, output) => {
+        for (const message of output.messages ?? []) {
+          for (const part of message.parts ?? []) {
+            if (part?.type === "text" && typeof part.text === "string") {
+              part.text = part.text.replaceAll(original, summary)
+            }
+          }
+        }
+      },
+    }
+  },
+}
+`
+}
+
 class LoopbackHost {
   constructor(options = {}) {
     this.options = options
@@ -1365,21 +1403,20 @@ class LoopbackHost {
       if (!existsSync(pluginPath)) throw new Error(`compiled plugin missing: ${pluginPath}`)
       const stmConfigDir = join(this.root, "config/opencode/opencode-stm")
       mkdirSync(stmConfigDir, { recursive: true })
-      const includeToolCalls = this.options.includeToolCalls === true
-      const includeToolResults = this.options.includeToolResults === true
-      const reviewerAgent = this.options.reviewerAgent ?? REVIEWER_AGENT
+      const reviewerModel = this.options.reviewerModel
+      const reviewerConfig = []
+      if (reviewerModel !== undefined) reviewerConfig.push(`model: ${JSON.stringify(reviewerModel)}`)
+      if (this.options.reviewerTimeoutSeconds !== undefined) {
+        reviewerConfig.push(`timeoutSeconds: ${this.options.reviewerTimeoutSeconds}`)
+      }
       writeFileSync(
         join(stmConfigDir, "config.yaml"),
         [
           "review:",
           "  enabled: true",
-          "  reviewer:",
-          `    agent: ${JSON.stringify(reviewerAgent)}`,
-          `    timeoutSeconds: ${this.options.reviewerTimeoutSeconds ?? 120}`,
-          "    transcript:",
-          `      includeToolCalls: ${includeToolCalls ? "true" : "false"}`,
-          `      includeToolResults: ${includeToolResults ? "true" : "false"}`,
-          "      maxBytes: 131072",
+          ...(reviewerConfig.length === 0
+            ? ["  reviewer: {}"]
+            : ["  reviewer:", ...reviewerConfig.map((line) => `    ${line}`)]),
           "historical:",
           "  readTitles: false",
           "  renameTitles: false",
@@ -1390,6 +1427,45 @@ class LoopbackHost {
     } else {
       pluginPath = join(this.root, "fixture-plugin.mjs")
       writeFileSync(pluginPath, pluginSource())
+    }
+
+    const agents = {
+      [PARENT_AGENT]: {
+        description: "Task-1 harness parent agent.",
+        mode: "primary",
+        model: "probe/mock",
+        permission: "allow",
+      },
+    }
+    // These agents support the independent host-prerequisite probes. Compiled
+    // plugin runtime scenarios intentionally rely on STM's config hook to
+    // register session-title-reviewer instead of defining it in this fixture.
+    if (this.options.compiledPlugin !== true) {
+      Object.assign(agents, {
+        [REVIEWER_AGENT]: {
+          description: "Task-1 restricted structured reviewer.",
+          mode: "subagent",
+          model: "probe/mock",
+          permission: {
+            read: "allow",
+            bash: "allow",
+            edit: "allow",
+            "*": "deny",
+          },
+        },
+        [REVIEWER_STRICT_AGENT]: {
+          description: "Task-1 amended strict reviewer with no allow rules.",
+          mode: "subagent",
+          model: "probe/mock",
+          permission: "deny",
+        },
+        [REVIEWER_PERMISSIVE_AGENT]: {
+          description: "Task-8 permissive reviewer used to test parent restrictions.",
+          mode: "subagent",
+          model: "probe/mock",
+          permission: "allow",
+        },
+      })
     }
 
     const config = {
@@ -1416,43 +1492,26 @@ class LoopbackHost {
               tool_call: true,
               limit: { context: 100000, output: 4096 },
             },
+            reviewer: {
+              name: "Reviewer Mock",
+              tool_call: true,
+              limit: { context: 100000, output: 4096 },
+            },
           },
         },
       },
-      agent: {
-        [PARENT_AGENT]: {
-          description: "Task-1 harness parent agent.",
-          mode: "primary",
-          model: "probe/mock",
-          permission: "allow",
-        },
-        [REVIEWER_AGENT]: {
-          description: "Task-1 restricted structured reviewer.",
-          mode: "subagent",
-          model: "probe/mock",
-          variant: "high",
-          permission: {
-            read: "allow",
-            bash: "allow",
-            edit: "allow",
-            "*": "deny",
-          },
-        },
-        [REVIEWER_STRICT_AGENT]: {
-          description: "Task-1 amended strict reviewer with no allow rules.",
-          mode: "subagent",
-          model: "probe/mock",
-          permission: "deny",
-        },
-        [REVIEWER_PERMISSIVE_AGENT]: {
-          description: "Task-8 permissive reviewer used to test parent restrictions.",
-          mode: "subagent",
-          model: "probe/mock",
-          variant: "high",
-          permission: "allow",
-        },
-      },
+      agent: agents,
     }
+    const pluginPaths = []
+    if (this.options.retainedSummaryFixture === true) {
+      const fixturePath = join(this.root, "retained-summary-fixture.mjs")
+      writeFileSync(fixturePath, retainedSummaryFixtureSource())
+      // Plugin hook order is intentional: the fixture substitutes one outgoing
+      // retained-text marker before STM captures its transform-boundary snapshot.
+      pluginPaths.push(fixturePath)
+    }
+    pluginPaths.push(pluginPath)
+    config.plugin = pluginPaths
     const configPath = join(this.root, "config/opencode/opencode.json")
     writeFileSync(configPath, JSON.stringify(config, null, 2))
 
@@ -2177,14 +2236,19 @@ class LoopbackHost {
   }
 
   async promptParent(parentID, text) {
+    const body = {
+      agent: PARENT_AGENT,
+      parts: [{ type: "text", text }],
+    }
+    if (this.options.callerVariant === undefined) {
+      body.model = { providerID: "probe", modelID: "mock" }
+    } else {
+      body.variant = this.options.callerVariant
+    }
     const prompted = await this.client.session.prompt({
       path: { id: parentID },
       query: { directory: this.directory },
-      body: {
-        agent: PARENT_AGENT,
-        model: { providerID: "probe", modelID: "mock" },
-        parts: [{ type: "text", text }],
-      },
+      body,
     })
     if (prompted.error !== undefined) {
       throw new Error(`parent prompt failed: ${JSON.stringify(prompted.error)}`)
@@ -2235,7 +2299,10 @@ class LoopbackHost {
 
     // Establish the scheduler baseline, seed eligible stored activity, then let
     // the provider issue the dispatch tool call from the transformed request.
-    await this.promptParent(parentID, BACKGROUND_SEED_MARKER)
+    const seedText = this.options.retainedSummaryFixture === true
+      ? `${BACKGROUND_SEED_MARKER}\n${BACKGROUND_REVIEW_ORIGINAL_MARKER}`
+      : BACKGROUND_SEED_MARKER
+    await this.promptParent(parentID, seedText)
     await this.waitForIdle(parentID)
     for (let index = 0; index < 20; index += 1) {
       const seeded = await this.client.session.prompt({
@@ -2296,11 +2363,14 @@ class LoopbackHost {
       parentID,
       titleBefore,
       dispatchAssistantMessageID: callerMessage?.info?.id ?? null,
+      dispatchAssistantVariant: dispatched.data?.info?.variant ?? null,
       dispatchUserMessageID: dispatched.data?.info?.parentID ?? null,
       dispatchStatus: startStatus,
       dispatchToolCount: toolParts.length,
       duplicateDispatch: duplicate ?? null,
       providerSawReviewReminder: dispatchRequest?.containsReviewReminder ?? null,
+      dispatchContextID: dispatchRequest?.reviewContextID ?? null,
+      toolContextID: toolPart?.state?.input?.contextID ?? null,
       cutoffMessageID: state?.backgroundReview?.cutoffMessageID ?? null,
       childID: state?.backgroundReview?.childSessionID ?? null,
       promptMessageID: state?.backgroundReview?.promptMessageID ?? null,

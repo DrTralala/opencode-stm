@@ -59,24 +59,39 @@ test("reminder text and part are deterministic", () => {
   assert.equal(reminderText("rev-1", 0), reminderText("rev-1", 0))
 })
 
-test("default reminder text is unchanged and background text delegates without user prompting", () => {
+test("default reminder text is unchanged and background text carries a context token without user prompting", () => {
   assert.equal(
     reminderText("rev-1", 0),
     `[opencode-stm] Title review rev-1 is due (reminder 1). Ask the user for one decision: keep the current title or rename it. Then call stm_title_review with decision "keep" or "rename" (rename also needs a new title) and expectedTitle equal to the current title. If this review is already resolved, ignore this reminder.`,
   )
-  const background = reminderText("rev-1", 0, "background")
+  const background = reminderText("rev-1", 0, "background", "ctx-first")
   assert.match(background, /stm_title_review_start/)
+  assert.match(background, /ctx-first/)
   assert.doesNotMatch(background, /Ask the user/)
   assert.match(background, /continue/i)
   assert.match(background, /active or resolved/i)
   assert.match(background, /without polling/i)
   assert.doesNotMatch(background, /stm_title_review with decision/)
-  assert.equal(makeReminderPart(anchor, "ses_1", "background").text, background)
+  assert.equal(makeReminderPart(anchor, "ses_1", "background", "ctx-first").text, background)
   assert.equal(makeReminderPart(anchor, "ses_1").text, reminderText("rev-1", 0))
 
   const messages = [assistant("m2")]
-  assert.equal(ensureAnchorPart(messages, { ...anchor, anchorMessageID: "m2" }, "background"), "added")
+  assert.equal(ensureAnchorPart(messages, { ...anchor, anchorMessageID: "m2" }, "background", "ctx-first"), "added")
   assert.equal(messages[0]?.parts[1]?.text, background)
+})
+
+test("a fresh background context token replaces the token on the existing owned reminder", () => {
+  const messages = [assistant("m2")]
+  const scopedAnchor = { ...anchor, anchorMessageID: "m2" }
+  assert.equal(ensureAnchorPart(messages, scopedAnchor, "background", "ctx-first"), "added")
+  const reminder = messages[0]?.parts[1]
+  assert.ok(reminder)
+  assert.equal(ensureAnchorPart(messages, scopedAnchor, "background", "ctx-second"), "updated")
+  assert.equal(messages[0]?.parts.length, 2)
+  assert.equal(messages[0]?.parts[1], reminder)
+  assert.match(String(reminder.text), /ctx-second/)
+  assert.doesNotMatch(String(reminder.text), /ctx-first/)
+  assert.equal((reminder.metadata?.["opencode-stm"] as Record<string, unknown>).contextID, "ctx-second")
 })
 
 test("removeAnchorPart removes only the exact owned synthetic reminder", () => {

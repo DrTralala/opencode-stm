@@ -11,6 +11,7 @@ import { DEFAULT_CONFIG } from "../src/config.js"
 import { createOperationGuard, createStateStore, hashSessionID, hashTitle, initialMeta } from "../src/state.js"
 import { lockManually } from "../src/scheduler.js"
 import { createRootCache } from "../src/sdk.js"
+import { createReviewSnapshots } from "../src/review-input.js"
 import { createTranscriptPager } from "../src/transcript.js"
 import { createBackgroundTools, createCurrentTools, type StmServices } from "../src/tools.js"
 import type { MutableMessage, MutablePart } from "../src/injection.js"
@@ -47,6 +48,7 @@ function makeServices(handlers: { get?: FakeHandler; update?: FakeHandler; messa
     state: createStateStore({ stateDir }),
     transcripts: createTranscriptPager(),
     roots: createRootCache(client),
+    reviewSnapshots: createReviewSnapshots(),
     guard: createOperationGuard(),
     blocked: new Map(),
     now: () => 0,
@@ -190,7 +192,7 @@ test("reviewer configuration adds only the dispatch tool", async () => {
   const configHome = track(mkdtempSync(join(tmpdir(), "stm-cfg-")))
   const configDir = join(configHome, "opencode", "opencode-stm")
   mkdirSync(configDir, { recursive: true })
-  writeFileSync(join(configDir, "config.yaml"), "review:\n  reviewer:\n    agent: title-worker\n")
+  writeFileSync(join(configDir, "config.yaml"), "review:\n  reviewer:\n    timeoutSeconds: 120\n")
   const hooks = await createStm({ client: fakeClient({}).client } as unknown as PluginInput, {
     env: { XDG_CONFIG_HOME: configHome, XDG_STATE_HOME: track(mkdtempSync(join(tmpdir(), "stm-state-"))) },
     home: configHome,
@@ -218,19 +220,49 @@ test("dispatch tools are absent without a coordinator and serialise a compact st
   const tools = createBackgroundTools(services)
   assert.deepEqual(Object.keys(tools), ["stm_title_review_start"])
   assert.deepEqual(Object.keys(tools.stm_title_review_start!.args).sort(), [
+    "contextID",
     "expectedTitle",
     "retry",
     "reviewID",
   ])
   const output = await tools.stm_title_review_start!.execute(
-    { reviewID: "rev-1", expectedTitle: DEFAULT_TITLE, retry: true },
+    { reviewID: "rev-1", expectedTitle: DEFAULT_TITLE, contextID: "ctx-1", retry: true },
     toolContext("msg_dispatch") as any,
   )
   assert.deepEqual(JSON.parse(String(output)), { plugin: "opencode-stm", status: "queued" })
   assert.equal((calls[0] as any).args.reviewID, "rev-1")
   assert.equal((calls[0] as any).args.expectedTitle, DEFAULT_TITLE)
   assert.equal((calls[0] as any).args.retry, true)
+  assert.equal((calls[0] as any).args.contextID, "ctx-1")
   assert.equal((calls[0] as any).context.messageID, "msg_dispatch")
+})
+
+test("the config hook registers STM's owned reviewer without making a catalogue request", async () => {
+  const configHome = track(mkdtempSync(join(tmpdir(), "stm-cfg-")))
+  const configDir = join(configHome, "opencode", "opencode-stm")
+  mkdirSync(configDir, { recursive: true })
+  writeFileSync(join(configDir, "config.yaml"), "review:\n  reviewer: {}\n")
+  const fake = fakeClient({})
+  const hooks = await createStm({ client: fake.client } as unknown as PluginInput, {
+    env: { XDG_CONFIG_HOME: configHome, XDG_STATE_HOME: track(mkdtempSync(join(tmpdir(), "stm-state-"))) },
+    home: configHome,
+  })
+  const hostConfig: any = {
+    agent: { unrelated: { mode: "primary", prompt: "keep" } },
+    permission: { edit: "ask" },
+  }
+
+  await hooks.config?.(hostConfig)
+
+  const reviewer = hostConfig.agent["session-title-reviewer"]
+  assert.equal(reviewer.mode, "subagent")
+  assert.equal(reviewer.hidden, true)
+  assert.deepEqual(reviewer.tools, { "*": false })
+  assert.deepEqual(reviewer.permission, { "*": "deny" })
+  assert.equal(reviewer.model, undefined)
+  assert.equal(hostConfig.agent.unrelated.prompt, "keep")
+  assert.deepEqual(hostConfig.permission, { edit: "ask" })
+  assert.equal(fake.calls.some((call) => call.method === "provider.list"), false)
 })
 
 test("creation failure exposes no tools or hooks and emits one safe diagnostic", async () => {
@@ -326,7 +358,7 @@ test("reviewer mode injects background dispatch wording while default mode is un
   const { services } = makeServices()
   services.config = {
     ...DEFAULT_CONFIG,
-    review: { ...DEFAULT_CONFIG.review, enabled: true, reviewer: { agent: "worker", timeoutSeconds: 120, transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 } } },
+    review: { ...DEFAULT_CONFIG.review, enabled: true, reviewer: { timeoutSeconds: 120 } },
   }
   await services.state.save("ses_1", pendingReviewMeta())
   services.roots.remember("ses_1", true)
@@ -338,6 +370,7 @@ test("reviewer mode injects background dispatch wording while default mode is un
   assert.ok(reminder, "pending review reminder was injected")
   assert.match(String(reminder.text), /stm_title_review_start/)
   assert.doesNotMatch(String(reminder.text), /Ask the user/)
+  assert.match(String(reminder.text), /contextID/)
 })
 
 test("an active background attempt removes only its owned replay part and retains persisted anchors", async () => {
@@ -347,7 +380,7 @@ test("an active background attempt removes only its owned replay part and retain
     review: {
       ...DEFAULT_CONFIG.review,
       enabled: true,
-      reviewer: { agent: "worker", timeoutSeconds: 120, transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 } },
+      reviewer: { timeoutSeconds: 120 },
     },
   }
   await services.state.save("ses_1", activeMeta())
@@ -369,7 +402,7 @@ test("an active background attempt removes only its owned replay part and retain
   }
   const toolPart: MutablePart = { id: "tool-1", type: "tool", tool: "bash", state: { status: "completed" } }
   const messages: MutableMessage[] = [{
-    info: { id: "m1", sessionID: "ses_1", role: "assistant" },
+    info: { id: "m1", sessionID: "ses_1", role: "user" },
     parts: [{ id: "m1-text", type: "text", text: "parent work" }, toolPart, unrelatedPart, activePart],
   }]
 
@@ -619,6 +652,9 @@ test("session.deleted removes only the hashed state file", async () => {
   await services.state.save("ses_2", initialMeta())
   services.blocked.set("ses_1", new Set(["ses_t"]))
   services.blocked.set("ses_other", new Set(["ses_1"]))
+  const captured = services.reviewSnapshots!.capture("ses_1", [user("m1")])
+  assert.equal(captured.ok, true)
+  if (!captured.ok) return
 
   const hook = createEventHook(services)
   await hook({ event: { type: "session.deleted", properties: { info: { id: "ses_1" } } } } as any)
@@ -627,6 +663,77 @@ test("session.deleted removes only the hashed state file", async () => {
   assert.equal(existsSync(join(stateDir, `${hashSessionID("ses_2")}.json`)), true)
   assert.equal(services.blocked.has("ses_1"), false)
   assert.equal(services.blocked.get("ses_other")?.size ?? 0, 0)
+  assert.deepEqual(services.reviewSnapshots!.claim("ses_1", captured.value.contextID, "msg_dispatch"), {
+    ok: false,
+    reason: "review-context-missing",
+  })
+})
+
+test("parent idle, idle-status and error events discard cached context but preserve a claimed copy", async () => {
+  const { services } = makeServices()
+  const hook = createEventHook(services)
+  const events = [
+    { type: "session.idle", properties: { sessionID: "ses_1" } },
+    { type: "session.status", properties: { sessionID: "ses_1", status: { type: "idle" } } },
+    { type: "session.error", properties: { sessionID: "ses_1", error: { name: "ProviderError" } } },
+  ]
+
+  for (const event of events) {
+    const captured = services.reviewSnapshots!.capture("ses_1", [user("m1")])
+    assert.equal(captured.ok, true)
+    if (!captured.ok) return
+
+    await hook({ event } as any)
+
+    assert.deepEqual(services.reviewSnapshots!.claim("ses_1", captured.value.contextID, "msg_dispatch"), {
+      ok: false,
+      reason: "review-context-missing",
+    }, event.type)
+  }
+
+  const finalCapture = services.reviewSnapshots!.capture("ses_1", [user("m1")])
+  assert.equal(finalCapture.ok, true)
+  if (!finalCapture.ok) return
+  const claimed = services.reviewSnapshots!.claim("ses_1", finalCapture.value.contextID, "msg_dispatch")
+  assert.equal(claimed.ok, true)
+  if (!claimed.ok) return
+
+  await hook({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } } as any)
+
+  assert.match(claimed.value.records, /message m1/)
+})
+
+test("each pending background reminder receives a fresh snapshot token and uses actual retained text", async () => {
+  const { services } = makeServices()
+  services.config = {
+    ...DEFAULT_CONFIG,
+    review: { ...DEFAULT_CONFIG.review, enabled: true, reviewer: { timeoutSeconds: 120 } },
+  }
+  services.roots.remember("ses_1", true)
+  await services.state.save("ses_1", pendingReviewMeta())
+  const messages: MutableMessage[] = [user("m1")]
+  const transform = createTransform(services)
+
+  await transform({}, { messages } as any)
+  const reminder = () => messages[0]?.parts.find((part) => part.id === "stm-reminder-rev-1-0")
+  const contextID = () => String(reminder()?.text).match(/contextID ("[^"]+")/)?.[1]
+  const firstToken = contextID()
+  assert.ok(firstToken)
+  assert.match(String(reminder()?.text), new RegExp(firstToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+
+  messages[0]!.parts[0]!.text = "UPDATED_RETAINED_TEXT"
+  await transform({}, { messages } as any)
+  const nextToken = contextID()
+  assert.ok(nextToken)
+  assert.notEqual(nextToken, firstToken)
+  assert.equal(services.reviewSnapshots!.claim("ses_1", JSON.parse(firstToken!), "msg_dispatch").ok, false)
+
+  const captured = services.reviewSnapshots!.claim("ses_1", JSON.parse(nextToken!), "msg_dispatch")
+  assert.equal(captured.ok, true)
+  if (!captured.ok) return
+  assert.equal(captured.value.parentUserID, "m1")
+  assert.match(captured.value.records, /UPDATED_RETAINED_TEXT/)
+  assert.doesNotMatch(captured.value.records, /Title review|contextID/)
 })
 
 test("lifecycle events reach the coordinator before deletion cleanup", async () => {

@@ -14,18 +14,10 @@ review:
   intervalMessages: 20
   maxReminders: 3
   backoffMultiplier: 2
-  # Background title review is opt-in and discloses transcript data to the
-  # selected agent's provider under normal OpenCode permissions. Uncomment this
-  # block and set agent to an enabled OpenCode agent whose mode supports
-  # subagent use; that agent's model and prompt are configured in OpenCode.
-  # The transcript excludes tool calls and results unless explicitly enabled.
   # reviewer:
-  #   agent: session-title-reviewer
+  #   model: provider/model-id
   #   timeoutSeconds: 120
-  #   transcript:
-  #     includeToolCalls: false
-  #     includeToolResults: false
-  #     maxBytes: 131072
+
 historical:
   readTitles: false
   renameTitles: false

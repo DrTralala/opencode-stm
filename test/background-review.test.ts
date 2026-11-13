@@ -12,14 +12,45 @@ import { hashSessionID, hashTitle, initialMeta, createStateStore, createOperatio
 import { createRootCache } from "../src/sdk.js"
 import { createTranscriptPager } from "../src/transcript.js"
 import { createBackgroundReviewer, type ReviewApplier } from "../src/background-review.js"
+import type { ReviewSnapshot, ReviewSnapshots } from "../src/review-input.js"
+import type { MutableMessage } from "../src/injection.js"
 import type { StmServices } from "../src/tools.js"
-import { fakeClient, headerResponse, type FakeHandler, type FakeHandlers } from "./fakes.js"
+import { fakeClient, type FakeHandler, type FakeHandlers } from "./fakes.js"
 
 const PARENT = "ses_1"
 const CHILD = "ses_child"
 const REVIEW_ID = "review-1"
 const TITLE = "Existing reviewable title"
 const PROMPT_TEXT = "SECRET_TRANSCRIPT"
+const CONTEXT_ID = "ctx-background-test"
+
+const FIXTURE_SNAPSHOT: ReviewSnapshot = Object.freeze({
+  contextID: CONTEXT_ID,
+  sessionID: PARENT,
+  parentUserID: "msg_user",
+  records: JSON.stringify({ role: "user", messageID: "msg_user", partID: "part_user", kind: "text", text: PROMPT_TEXT }),
+  messageCount: 1,
+})
+
+function fixtureSnapshots(): ReviewSnapshots {
+  return {
+    capture(sessionID: string, _messages: MutableMessage[]) {
+      return sessionID === PARENT
+        ? { ok: true, value: FIXTURE_SNAPSHOT }
+        : { ok: false, reason: "review-snapshot-invalid" }
+    },
+    claim(sessionID: string, contextID: string, messageID: string) {
+      if (sessionID !== PARENT) return { ok: false, reason: "review-context-session-mismatch" }
+      if (contextID !== CONTEXT_ID || messageID !== "msg_dispatch") {
+        return { ok: false, reason: "review-context-stale" }
+      }
+      return { ok: true, value: FIXTURE_SNAPSHOT }
+    },
+    release() {},
+    discard() {},
+    clear() {},
+  }
+}
 
 const createdDirs: string[] = []
 
@@ -58,11 +89,7 @@ function configured(overrides: Partial<StmConfig["review"]> = {}): StmConfig {
       intervalMessages: 20,
       maxReminders: 3,
       backoffMultiplier: 2,
-      reviewer: {
-        agent: "session-title-reviewer",
-        timeoutSeconds: 120,
-        transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 },
-      },
+      reviewer: { timeoutSeconds: 120 },
       ...overrides,
     },
     historical: { ...DEFAULT_CONFIG.historical },
@@ -91,17 +118,6 @@ function makeContext(options: {
   } as unknown as ToolContext & { asks: any[] }
   context.asks = asks
   return { context, controller }
-}
-
-function cutoffMessage(): any {
-  return { info: { id: "msg_dispatch", sessionID: PARENT, role: "assistant" }, parts: [] }
-}
-
-function olderUserMessage(): any {
-  return {
-    info: { id: "msg_user", sessionID: PARENT, role: "user" },
-    parts: [{ id: "part_user", sessionID: PARENT, messageID: "msg_user", type: "text", text: PROMPT_TEXT }],
-  }
 }
 
 function completionMessages(promptMessageID: string, text: string): any[] {
@@ -161,7 +177,10 @@ async function seedPendingReview(harness: Harness, overrides: Partial<SessionMet
 type HarnessOptions = {
   config?: StmConfig
   title?: string
+  dispatchParentID?: string
   handlers?: Partial<FakeHandlers>
+  provider?: FakeHandler
+  reviewSnapshots?: ReviewSnapshots | null
   toast?: (options: any) => Promise<unknown>
   now?: number
 }
@@ -173,7 +192,7 @@ type Harness = {
   calls: Array<{ method: string; options: any }>
   toastCalls: any[]
   applied: any[]
-  setTranscript: (handler: FakeHandler) => void
+  setCreate: (handler: FakeHandler) => void
   setCompletion: (handler: FakeHandler) => void
   completeWith: (text: string) => void
   pendingCompletion: () => void
@@ -189,10 +208,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), "stm-background-"))
   createdDirs.push(dir)
   let now = options.now ?? 1_000_000
-  let transcriptHandler: FakeHandler = async () => ({
-    data: [olderUserMessage(), cutoffMessage()],
-    response: headerResponse("x-next-cursor", null),
-  })
+  let createHandler: FakeHandler = options.handlers?.create ?? (async (input: any) => ({ data: { id: CHILD, parentID: input.body.parentID } }))
   let completionHandler: FakeHandler = async () => ({ data: [] })
   let promptMessageID: string | null = null
   const toastCalls: any[] = []
@@ -210,6 +226,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
           id: input.path.messageID,
           sessionID: input.path.id,
           role: "assistant",
+          parentID: options.dispatchParentID ?? "msg_user",
           providerID: "provider-1",
           modelID: "model-1",
         },
@@ -218,12 +235,11 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     agents: async () => ({
       data: [
         { name: "build", mode: "primary" },
-        { name: "session-title-reviewer", mode: "subagent", model: { providerID: "provider-1", modelID: "review-model" } },
+        { name: "session-title-reviewer", mode: "subagent" },
       ],
     }),
-    messages: async (input: any) =>
-      input.path.id === CHILD ? completionHandler(input) : transcriptHandler(input),
-    create: async (input: any) => ({ data: { id: CHILD, parentID: input.body.parentID } }),
+    messages: async (input: any) => input.path.id === CHILD ? completionHandler(input) : ({ data: [] }),
+    create: async (input: any) => createHandler(input),
     promptAsync: async (input: any) => {
       promptMessageID = input.body.messageID
       return {}
@@ -236,12 +252,25 @@ function makeHarness(options: HarnessOptions = {}): Harness {
   const handlers: FakeHandlers = {
     ...baseHandlers,
     ...options.handlers,
+    create: async (input: any) => createHandler(input),
     promptAsync: async (input: any) => {
       promptMessageID = input.body.messageID
       return promptHandler(input)
     },
   }
   const fake = fakeClient(handlers)
+  ;(fake.client as any).provider = {
+    list: async (input: any) => {
+      fake.calls.push({ method: "provider.list", options: input })
+      if (options.provider !== undefined) return options.provider(input)
+      return {
+        data: {
+          all: [{ id: "provider-1", models: { "model-1": { id: "model-1" }, "review-model": { id: "review-model" } } }],
+          connected: ["provider-1"],
+        },
+      }
+    },
+  }
   const toast = options.toast ?? (async (input: any) => {
     toastCalls.push(input)
     return { data: true }
@@ -257,6 +286,9 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     guard: createOperationGuard(),
     blocked: new Map(),
     now: () => now,
+    ...(options.reviewSnapshots === null
+      ? {}
+      : { reviewSnapshots: options.reviewSnapshots ?? fixtureSnapshots() }),
   }
 
   const reviewer = createBackgroundReviewer(services, async (input, signal) => {
@@ -271,8 +303,8 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     calls: fake.calls,
     toastCalls,
     applied,
-    setTranscript(handler) {
-      transcriptHandler = handler
+    setCreate(handler) {
+      createHandler = handler
     },
     setCompletion(handler) {
       completionHandler = handler
@@ -299,7 +331,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
 }
 
 function startArgs(expectedTitle = TITLE, retry?: boolean) {
-  return { reviewID: REVIEW_ID, expectedTitle, ...(retry === undefined ? {} : { retry }) }
+  return { reviewID: REVIEW_ID, expectedTitle, contextID: CONTEXT_ID, ...(retry === undefined ? {} : { retry }) }
 }
 
 function countCalls(harness: Harness, method: string): number {
@@ -334,7 +366,7 @@ test("disabled review and missing reviewer refuse dispatch before any permission
   assert.equal(withoutReviewer.calls.length, 0)
 })
 
-test("child callers are denied without transcript, child creation or permission asks", async (t) => {
+test("a child session cannot claim the root session's retained context", async (t) => {
   const harness = makeHarness({
     handlers: {
       get: async (input: any) => ({
@@ -346,7 +378,7 @@ test("child callers are denied without transcript, child creation or permission 
   await seedPendingReview(harness)
   const { context } = makeContext({ sessionID: "ses_child_caller" })
   const result = await harness.reviewer.start(startArgs(), context)
-  assert.equal(result.status, "denied")
+  assert.deepEqual(result, { status: "error", reason: "review-context-session-mismatch" })
   assert.equal(context.asks.length, 0)
   assert.equal(messagesFor(harness, PARENT).length, 0)
   assert.equal(countCalls(harness, "create"), 0)
@@ -435,7 +467,7 @@ test("an abort during admission returns aborted and starts no worker", async (t)
   assert.equal(preAborted.calls.length, 0)
 })
 
-test("the approved permission asks carry delegation and transcript scope but no transcript bytes", async (t) => {
+test("the approved permission asks declare retained-text scope without transcript content or limits", async (t) => {
   const harness = makeHarness()
   t.after(() => harness.reviewer.dispose())
   await seedPendingReview(harness)
@@ -454,20 +486,18 @@ test("the approved permission asks carry delegation and transcript scope but no 
     assert.equal(encoded.includes(PROMPT_TEXT), false)
     assert.equal(encoded.includes(TITLE), false)
     assert.equal(ask.metadata.delegation !== undefined, true)
-    assert.deepEqual(ask.metadata.transcript, {
-      includeToolCalls: false,
-      includeToolResults: false,
-      maxBytes: 131072,
-    })
+    assert.equal(ask.metadata.input, "retained-text")
+    assert.equal(ask.metadata.transcript, undefined)
+    assert.equal(ask.metadata.maxBytes, undefined)
   }
 })
 
-test("start resolves queued while the first transcript page is held, and concurrent starts reserve once", async (t) => {
+test("start resolves queued while child creation is held, and concurrent starts reserve once", async (t) => {
   const harness = makeHarness()
   t.after(() => harness.reviewer.dispose())
   await seedPendingReview(harness)
-  const page = deferred<any>()
-  harness.setTranscript(async () => page.promise)
+  const creation = deferred<any>()
+  harness.setCreate(async () => creation.promise)
 
   const first = makeContext()
   const second = makeContext()
@@ -476,15 +506,15 @@ test("start resolves queued while the first transcript page is held, and concurr
     harness.reviewer.start(startArgs(), second.context),
   ])
   assert.deepEqual([one.status, two.status].sort(), ["active", "queued"])
-  assert.equal(page.settled(), false)
-  assert.equal(messagesFor(harness, PARENT).length, 1)
-  assert.equal(countCalls(harness, "create"), 0)
+  assert.equal(creation.settled(), false)
+  assert.equal(messagesFor(harness, PARENT).length, 0)
+  assert.equal(countCalls(harness, "create"), 1)
   assert.equal(countCalls(harness, "promptAsync"), 0)
 
-  page.resolve({ data: [olderUserMessage(), cutoffMessage()], response: headerResponse("x-next-cursor", null) })
+  creation.resolve({ data: { id: CHILD, parentID: PARENT } })
   await harness.waitForPrompt()
   assert.equal(countCalls(harness, "create"), 1)
-  assert.equal(messagesFor(harness, PARENT).length, 1)
+  assert.equal(messagesFor(harness, PARENT).length, 0)
 
   const attempt = harness.state()?.backgroundReview
   assert.notEqual(attempt, null)
@@ -501,6 +531,19 @@ test("start resolves queued while the first transcript page is held, and concurr
   assert.equal(prompt?.options.body.messageID, attempt?.promptMessageID)
   assert.equal(prompt?.options.body.format, undefined)
   assert.match(String(prompt?.options.body.parts[0].text), /SECRET_TRANSCRIPT/)
+  assert.ok(countCalls(harness, "message") >= 1 && countCalls(harness, "message") <= 2)
+})
+
+test("one admitted dispatch uses a parent point-read and never pages parent history", async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.reviewer.dispose())
+  await seedPendingReview(harness)
+
+  assert.equal((await harness.reviewer.start(startArgs(), makeContext().context)).status, "queued")
+  await harness.waitForPrompt()
+
+  assert.equal(countCalls(harness, "message"), 1)
+  assert.equal(messagesFor(harness, PARENT).length, 0)
 })
 
 test("successful completion applies once and duplicate idle, status and error events are ignored", async (t) => {
@@ -834,7 +877,7 @@ test("a failed toast call falls back to a short fixed stderr diagnostic", async 
   )
 })
 
-test("a missing configured reviewer is refused before permission, transcript or child work", async (t) => {
+test("a missing configured reviewer returns its safe SDK reason before admission", async (t) => {
   const harness = makeHarness({
     handlers: { agents: async () => ({ data: [{ name: "build", mode: "primary" }] }) },
   })
@@ -843,11 +886,107 @@ test("a missing configured reviewer is refused before permission, transcript or 
   const { context } = makeContext()
   const result = await harness.reviewer.start(startArgs(), context)
   assert.equal(result.status, "disabled")
-  assert.equal(result.reason, "reviewer-unavailable")
+  assert.equal(result.reason, "sdk: review context reviewer agent missing")
   assert.equal(context.asks.length, 0)
   assert.equal(messagesFor(harness, PARENT).length, 0)
   assert.equal(countCalls(harness, "create"), 0)
   assert.equal(countCalls(harness, "promptAsync"), 0)
+})
+
+test("an explicit unavailable model reports the setting-scoped catalogue failure without fallback", async (t) => {
+  const harness = makeHarness({
+    config: configured({ reviewer: { model: "provider-1/not-connected", timeoutSeconds: 120 } }),
+  })
+  t.after(() => harness.reviewer.dispose())
+  await seedPendingReview(harness)
+  const { context } = makeContext()
+
+  const result = await harness.reviewer.start(startArgs(), context)
+
+  assert.deepEqual(result, {
+    status: "disabled",
+    reason: "config: review.reviewer.model is not available from a connected provider",
+  })
+  assert.equal(context.asks.length, 0)
+  assert.equal(countCalls(harness, "create"), 0)
+  assert.equal(countCalls(harness, "promptAsync"), 0)
+  assert.equal(countCalls(harness, "provider.list"), 1)
+})
+
+test("the dispatch assistant must point to the captured parent user before permissions are asked", async (t) => {
+  const harness = makeHarness({ dispatchParentID: "msg_different_user" })
+  t.after(() => harness.reviewer.dispose())
+  await seedPendingReview(harness)
+  const { context } = makeContext()
+
+  assert.deepEqual(await harness.reviewer.start(startArgs(), context), {
+    status: "error",
+    reason: "review-context-parent-mismatch",
+  })
+  assert.equal(context.asks.length, 0)
+  assert.equal(countCalls(harness, "create"), 0)
+  assert.equal(countCalls(harness, "promptAsync"), 0)
+})
+
+test("a restart can report active or uncertain recovery status without an in-memory snapshot", async (t) => {
+  const active = makeHarness({ reviewSnapshots: null })
+  t.after(() => active.reviewer.dispose())
+  const deadline = active.now() + 60_000
+  await seedPendingReview(active, {
+    backgroundReview: {
+      id: "attempt-foreign",
+      reviewID: REVIEW_ID,
+      ownerID: "owner-foreign",
+      phase: "active",
+      titleDigest: hashTitle(TITLE),
+      cutoffMessageID: "msg_dispatch",
+      activityAtDispatch: 42,
+      deadline,
+      childSessionID: CHILD,
+      promptMessageID: "msg_prompt",
+      stop: "pending",
+      failureCode: null,
+    },
+  })
+  assert.deepEqual(await active.reviewer.start(startArgs(), makeContext().context), {
+    status: "active",
+    reason: "foreign-owner",
+  })
+
+  const uncertain = makeHarness({ reviewSnapshots: null })
+  t.after(() => uncertain.reviewer.dispose())
+  await seedPendingReview(uncertain, {
+    backgroundReview: {
+      id: "attempt-uncertain",
+      reviewID: REVIEW_ID,
+      ownerID: "owner-foreign",
+      phase: "uncertain",
+      titleDigest: hashTitle(TITLE),
+      cutoffMessageID: "msg_dispatch",
+      activityAtDispatch: 42,
+      deadline: uncertain.now() + 60_000,
+      childSessionID: CHILD,
+      promptMessageID: "msg_prompt",
+      stop: "confirmed",
+      failureCode: "background-uncertain-write",
+    },
+  })
+  assert.deepEqual(await uncertain.reviewer.start(startArgs(TITLE, true), makeContext().context), { status: "uncertain" })
+})
+
+test("a pending review with no retained snapshot fails explicitly before admission", async (t) => {
+  const harness = makeHarness({ reviewSnapshots: null })
+  t.after(() => harness.reviewer.dispose())
+  await seedPendingReview(harness)
+  const { context } = makeContext()
+
+  assert.deepEqual(await harness.reviewer.start(startArgs(), context), {
+    status: "error",
+    reason: "review-context-missing",
+  })
+  assert.equal(context.asks.length, 0)
+  assert.equal(countCalls(harness, "agents"), 0)
+  assert.equal(countCalls(harness, "create"), 0)
 })
 
 test("caller abort after queued acceptance does not cancel detached work", async (t) => {

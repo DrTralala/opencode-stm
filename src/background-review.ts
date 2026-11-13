@@ -7,7 +7,12 @@ import { randomBytes, randomUUID } from "node:crypto"
 import type { ToolContext } from "@opencode-ai/plugin"
 import type { ReviewerConfig } from "./config.js"
 import { reserveReview, revokeReview, type BackgroundAttempt, type Reservation } from "./background-state.js"
-import { collectReviewInput } from "./review-input.js"
+import {
+  formatReviewInput,
+  REVIEW_CONTEXT_MISSING,
+  type ReviewSnapshot,
+} from "./review-input.js"
+import { REVIEWER_AGENT_NAME } from "./reviewer-agent.js"
 import {
   createReviewChild,
   promptReviewChild,
@@ -22,7 +27,7 @@ import {
 import { hashTitle, type SessionMeta } from "./state.js"
 import type { StmServices } from "./tools.js"
 
-export type ReviewStartArgs = { reviewID: string; expectedTitle: string; retry?: boolean }
+export type ReviewStartArgs = { reviewID: string; expectedTitle: string; contextID: string; retry?: boolean }
 export type ReviewStartResult = {
   status:
     | "queued"
@@ -59,6 +64,7 @@ type OwnedJob = {
   agent: ReviewAgent
   permissions: PermissionRule[]
   reviewer: ReviewerConfig
+  snapshot: ReviewSnapshot | null
   title: string
   controller: AbortController
   settled: boolean
@@ -101,6 +107,7 @@ function validStartArgs(args: ReviewStartArgs): boolean {
     isRecord(args) &&
     isNonEmptyString(args.reviewID) &&
     typeof args.expectedTitle === "string" &&
+    isNonEmptyString(args.contextID) &&
     (args.retry === undefined || typeof args.retry === "boolean")
   )
 }
@@ -226,6 +233,7 @@ export function createBackgroundReviewer(services: StmServices, apply: ReviewApp
     if (job.settled) return false
     job.settled = true
     clearTimers(job)
+    job.snapshot = null
     job.promptText = null
     job.controller.abort()
     removeJob(job)
@@ -617,28 +625,12 @@ export function createBackgroundReviewer(services: StmServices, apply: ReviewApp
         return
       }
 
-      const collected = await collectReviewInput(
-        services.client,
-        {
-          sessionID: job.parentID,
-          cutoffMessageID: job.attempt.cutoffMessageID,
-          title: job.title,
-          config: job.reviewer.transcript,
-        },
-        job.controller.signal,
-      )
-      if (job.settled) return
-      if (!collected.ok) {
-        if (job.controller.signal.aborted) {
-          if (!job.settled && now() >= job.attempt.deadline) {
-            await failOwnedReview(job, "background-timeout")
-          }
-          return
-        }
+      if (job.snapshot === null) {
         await failOwnedReview(job, "background-input-rejected")
         return
       }
-      job.promptText = collected.value.text
+      job.promptText = formatReviewInput(job.snapshot, job.title)
+      job.snapshot = null
 
       if (!(await revalidateBeforeCreate(job))) return
 
@@ -727,7 +719,7 @@ export function createBackgroundReviewer(services: StmServices, apply: ReviewApp
           childID,
           promptMessageID,
           agent: job.agent,
-          text: collected.value.text,
+          text: job.promptText,
         },
         job.controller.signal,
       )
@@ -787,6 +779,7 @@ export function createBackgroundReviewer(services: StmServices, apply: ReviewApp
   }
 
   async function start(args: ReviewStartArgs, context: ToolContext): Promise<ReviewStartResult> {
+    let releaseSnapshot: { sessionID: string; contextID: string } | null = null
     try {
       if (disposed) return { status: "error", reason: "disposed" }
       if (!validStartArgs(args)) return { status: "error", reason: "invalid-arguments" }
@@ -802,6 +795,19 @@ export function createBackgroundReviewer(services: StmServices, apply: ReviewApp
       }
 
       const parentID = context.sessionID
+      // Claim synchronously before the first await. A later transform can
+      // replace the session's latest token without changing this immutable
+      // local value, while another assistant cannot reuse the same token.
+      const claimed = services.reviewSnapshots?.claim(parentID, args.contextID, context.messageID) ?? {
+        ok: false as const,
+        reason: REVIEW_CONTEXT_MISSING,
+      }
+      const snapshot = claimed.ok ? claimed.value : null
+      if (claimed.ok) releaseSnapshot = { sessionID: parentID, contextID: args.contextID }
+      else if (claimed.reason !== REVIEW_CONTEXT_MISSING) {
+        return { status: "error", reason: claimed.reason }
+      }
+
       const root = await services.roots.isRoot(parentID, context.abort)
       if (context.abort.aborted) return { status: "aborted" }
       if (!root.ok) return { status: "error", reason: "caller-unavailable" }
@@ -818,6 +824,7 @@ export function createBackgroundReviewer(services: StmServices, apply: ReviewApp
       if (loaded.value === null) return { status: "conflict", reason: "stale-review" }
       const early = earlyStatus(loaded.value, args)
       if (early !== null) return early
+      if (snapshot === null) return { status: "error", reason: REVIEW_CONTEXT_MISSING }
 
       const reviewContext = await readReviewExecutionContext(
         services.client,
@@ -825,32 +832,32 @@ export function createBackgroundReviewer(services: StmServices, apply: ReviewApp
           parentID,
           messageID: context.messageID,
           callerAgent: context.agent,
-          reviewerAgent: reviewer.agent,
+          reviewerAgent: REVIEWER_AGENT_NAME,
+          ...(reviewer.model === undefined ? {} : { model: reviewer.model }),
         },
         context.abort,
       )
       if (context.abort.aborted) return { status: "aborted" }
       if (disposed) return { status: "error", reason: "disposed" }
-      if (!reviewContext.ok) return { status: "disabled", reason: "reviewer-unavailable" }
-
-      const transcript = {
-        includeToolCalls: reviewer.transcript.includeToolCalls,
-        includeToolResults: reviewer.transcript.includeToolResults,
-        maxBytes: reviewer.transcript.maxBytes,
+      if (!reviewContext.ok) return { status: "disabled", reason: reviewContext.reason }
+      if (reviewContext.value.dispatchParentID !== snapshot.parentUserID) {
+        return { status: "error", reason: "review-context-parent-mismatch" }
       }
+
       const scope = {
         delegation: "title-review",
         reviewID: args.reviewID,
-        reviewerAgent: reviewer.agent,
+        reviewerAgent: REVIEWER_AGENT_NAME,
         timeoutSeconds: reviewer.timeoutSeconds,
-        transcript,
+        contextID: args.contextID,
+        input: "retained-text",
       }
       const startAsk = await askFor(context, "stm_title_review_start", [parentID], {
         ...scope,
         authority: "keep-or-rename",
       })
       if (!startAsk.ok) return { status: startAsk.status }
-      const taskAsk = await askFor(context, "task", [reviewer.agent], scope)
+      const taskAsk = await askFor(context, "task", [REVIEWER_AGENT_NAME], scope)
       if (!taskAsk.ok) return { status: taskAsk.status }
       const reviewAsk = await askFor(context, "stm_title_review", [parentID], {
         ...scope,
@@ -936,6 +943,7 @@ export function createBackgroundReviewer(services: StmServices, apply: ReviewApp
         agent: reviewContext.value.agent,
         permissions: reviewContext.value.childPermissions,
         reviewer,
+        snapshot,
         title: outcome.title,
         controller: new AbortController(),
         settled: false,
@@ -968,6 +976,10 @@ export function createBackgroundReviewer(services: StmServices, apply: ReviewApp
       return { status: "queued" }
     } catch {
       return { status: "error", reason: "internal" }
+    } finally {
+      if (releaseSnapshot !== null) {
+        services.reviewSnapshots?.release(releaseSnapshot.sessionID, releaseSnapshot.contextID)
+      }
     }
   }
 
@@ -1034,6 +1046,7 @@ export function createBackgroundReviewer(services: StmServices, apply: ReviewApp
       if (job !== undefined) {
         job.settled = true
         clearTimers(job)
+        job.snapshot = null
         job.promptText = null
         job.controller.abort()
         removeJob(job)
@@ -1166,6 +1179,7 @@ export function createBackgroundReviewer(services: StmServices, apply: ReviewApp
       // Stop new application immediately, but keep timers inert until persisted
       // revocation and the fresh remote-stop attempt have run.
       job.settled = true
+      job.snapshot = null
       job.promptText = null
       job.controller.abort()
       jobs.delete(job.parentID)

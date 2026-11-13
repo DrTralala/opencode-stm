@@ -26,13 +26,8 @@ const PACKAGED_TEMPLATE_PATH = fileURLToPath(new URL("../../config.example.yaml"
 const CREATION_FAILED_REASON = "config: user configuration could not be created"
 
 export type ReviewerConfig = {
-  agent: string
+  model?: string
   timeoutSeconds: number
-  transcript: {
-    includeToolCalls: boolean
-    includeToolResults: boolean
-    maxBytes: number
-  }
 }
 
 export type ReviewConfig = {
@@ -82,8 +77,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 const TOP_KEYS = new Set(["review", "historical"])
 const REVIEW_KEYS = new Set(["enabled", "intervalMessages", "maxReminders", "backoffMultiplier", "reviewer"])
-const REVIEWER_KEYS = new Set(["agent", "timeoutSeconds", "transcript"])
-const REVIEWER_TRANSCRIPT_KEYS = new Set(["includeToolCalls", "includeToolResults", "maxBytes"])
+const REVIEWER_KEYS = new Set(["model", "timeoutSeconds"])
+const OBSOLETE_REVIEWER_KEYS = new Set(["agent", "transcript", "includeToolCalls", "includeToolResults", "maxBytes"])
 const HISTORICAL_KEYS = new Set(["readTitles", "renameTitles", "readTranscript"])
 
 function findUnknownKey(input: Record<string, unknown>, allowed: ReadonlySet<string>, prefix: string): string | null {
@@ -91,6 +86,21 @@ function findUnknownKey(input: Record<string, unknown>, allowed: ReadonlySet<str
     if (!allowed.has(key)) return `config: unknown key ${prefix}${key}`
   }
   return null
+}
+
+function findReviewerKeyError(input: Record<string, unknown>): string | null {
+  for (const key of Object.keys(input)) {
+    if (OBSOLETE_REVIEWER_KEYS.has(key)) {
+      return `config: review.reviewer.${key} is obsolete; remove it because STM now owns the reviewer and retained input`
+    }
+  }
+  return findUnknownKey(input, REVIEWER_KEYS, "review.reviewer.")
+}
+
+function validReviewerModel(value: unknown): value is string {
+  if (typeof value !== "string") return false
+  const segments = value.split("/")
+  return segments.length >= 2 && segments.every((segment) => segment.length > 0 && !/\s/.test(segment))
 }
 
 function readBoolean(input: Record<string, unknown>, key: string, prefix: string, fallback: boolean): boolean | string {
@@ -158,56 +168,24 @@ export function parseConfigText(text: string): ConfigResult {
     review.backoffMultiplier = backoffMultiplier
 
     if (raw.review.reviewer !== undefined) {
-      if (!isPlainObject(raw.review.reviewer)) return { ok: false, reason: "config: review.reviewer must be a mapping" }
-      const error = findUnknownKey(raw.review.reviewer, REVIEWER_KEYS, "review.reviewer.")
-      if (error !== null) return { ok: false, reason: error }
-      const rawAgent = raw.review.reviewer.agent
-      if (typeof rawAgent !== "string" || rawAgent.trim() === "") {
-        return { ok: false, reason: "config: review.reviewer.agent must be a non-empty string" }
+      if (raw.review.reviewer !== null && !isPlainObject(raw.review.reviewer)) {
+        return { ok: false, reason: "config: review.reviewer must be a mapping or null" }
       }
-      const timeoutSeconds = readInteger(raw.review.reviewer, "timeoutSeconds", "review.reviewer.", 10, 600, 120)
+      const reviewerInput = raw.review.reviewer === null ? {} : raw.review.reviewer
+      const error = findReviewerKeyError(reviewerInput)
+      if (error !== null) return { ok: false, reason: error }
+      const timeoutSeconds = readInteger(reviewerInput, "timeoutSeconds", "review.reviewer.", 10, 600, 120)
       if (typeof timeoutSeconds === "string") return { ok: false, reason: timeoutSeconds }
 
-      const transcript = { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 }
-      if (raw.review.reviewer.transcript !== undefined) {
-        if (!isPlainObject(raw.review.reviewer.transcript)) {
-          return { ok: false, reason: "config: review.reviewer.transcript must be a mapping" }
+      let model: string | undefined
+      if (reviewerInput.model !== undefined) {
+        if (!validReviewerModel(reviewerInput.model)) {
+          return { ok: false, reason: "config: review.reviewer.model must be provider/model-id without whitespace" }
         }
-        const transcriptError = findUnknownKey(
-          raw.review.reviewer.transcript,
-          REVIEWER_TRANSCRIPT_KEYS,
-          "review.reviewer.transcript.",
-        )
-        if (transcriptError !== null) return { ok: false, reason: transcriptError }
-        const includeToolCalls = readBoolean(
-          raw.review.reviewer.transcript,
-          "includeToolCalls",
-          "review.reviewer.transcript.",
-          transcript.includeToolCalls,
-        )
-        if (typeof includeToolCalls === "string") return { ok: false, reason: includeToolCalls }
-        const includeToolResults = readBoolean(
-          raw.review.reviewer.transcript,
-          "includeToolResults",
-          "review.reviewer.transcript.",
-          transcript.includeToolResults,
-        )
-        if (typeof includeToolResults === "string") return { ok: false, reason: includeToolResults }
-        const maxBytes = readInteger(
-          raw.review.reviewer.transcript,
-          "maxBytes",
-          "review.reviewer.transcript.",
-          4096,
-          1048576,
-          131072,
-        )
-        if (typeof maxBytes === "string") return { ok: false, reason: maxBytes }
-        transcript.includeToolCalls = includeToolCalls
-        transcript.includeToolResults = includeToolResults
-        transcript.maxBytes = maxBytes
+        model = reviewerInput.model
       }
 
-      review.reviewer = { agent: rawAgent.trim(), timeoutSeconds, transcript }
+      review.reviewer = model === undefined ? { timeoutSeconds } : { model, timeoutSeconds }
     }
   }
 

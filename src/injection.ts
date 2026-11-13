@@ -56,11 +56,19 @@ export function hasPart(message: MutableMessage, partID: string): boolean {
 
 export type ReminderMode = "main" | "background"
 
-export function reminderText(reviewID: string, reminderIndex: number, mode: ReminderMode = "main"): string {
+export function reminderText(
+  reviewID: string,
+  reminderIndex: number,
+  mode: ReminderMode = "main",
+  contextID?: string,
+): string {
   if (mode === "background") {
+    if (typeof contextID !== "string" || contextID.length === 0) {
+      throw new Error("background reminder context is unavailable")
+    }
     return [
       `[opencode-stm] Title review ${reviewID} is due (reminder ${reminderIndex + 1}).`,
-      `Call stm_title_review_start with reviewID ${JSON.stringify(reviewID)} and expectedTitle equal to the current title, then continue your task.`,
+      `Call stm_title_review_start with reviewID ${JSON.stringify(reviewID)}, contextID ${JSON.stringify(contextID)} and expectedTitle equal to the current title, then continue your task.`,
       `Do not collect the transcript, choose a title, or wait for or poll the reviewer.`,
       `If this review is already active or resolved, ignore this reminder and continue without polling.`,
     ].join(" ")
@@ -73,15 +81,27 @@ export function reminderText(reviewID: string, reminderIndex: number, mode: Remi
   ].join(" ")
 }
 
-export function makeReminderPart(anchor: AnchorState, sessionID: string, mode: ReminderMode = "main"): MutablePart {
+export function makeReminderPart(
+  anchor: AnchorState,
+  sessionID: string,
+  mode: ReminderMode = "main",
+  contextID?: string,
+): MutablePart {
+  const marker = { reviewID: anchor.reviewID, reminderIndex: anchor.reminderIndex }
+  if (mode === "background") {
+    if (typeof contextID !== "string" || contextID.length === 0) {
+      throw new Error("background reminder context is unavailable")
+    }
+    Object.assign(marker, { contextID })
+  }
   return {
     id: anchor.partID,
     sessionID,
     messageID: anchor.anchorMessageID,
     type: "text",
-    text: reminderText(anchor.reviewID, anchor.reminderIndex, mode),
+    text: reminderText(anchor.reviewID, anchor.reminderIndex, mode, contextID),
     synthetic: true,
-    metadata: { "opencode-stm": { reviewID: anchor.reviewID, reminderIndex: anchor.reminderIndex } },
+    metadata: { "opencode-stm": marker },
   }
 }
 
@@ -89,11 +109,30 @@ export function ensureAnchorPart(
   messages: MutableMessage[],
   anchor: AnchorState,
   mode: ReminderMode = "main",
-): "present" | "added" | "anchor-missing" {
+  contextID?: string,
+): "present" | "added" | "updated" | "anchor-missing" | "context-missing" {
+  if (mode === "background" && (typeof contextID !== "string" || contextID.length === 0)) return "context-missing"
   const message = findMessage(messages, anchor.anchorMessageID)
   if (message === undefined) return "anchor-missing"
-  if (hasPart(message, anchor.partID)) return "present"
-  message.parts.push(makeReminderPart(anchor, message.info.sessionID ?? "", mode))
+  const existing = message.parts.find((part) => part.id === anchor.partID)
+  if (existing !== undefined) {
+    const marker = existing.metadata?.["opencode-stm"]
+    if (mode !== "background" || existing.type !== "text" || existing.synthetic !== true ||
+      typeof marker !== "object" || marker === null || Array.isArray(marker)) {
+      return "present"
+    }
+    const owned = marker as Record<string, unknown>
+    if (owned.reviewID !== anchor.reviewID || owned.reminderIndex !== anchor.reminderIndex) return "present"
+    const fresh = makeReminderPart(anchor, message.info.sessionID ?? "", mode, contextID)
+    const changed = existing.text !== fresh.text || owned.contextID !== contextID
+    if (!changed) return "present"
+    existing.text = fresh.text
+    existing.metadata = fresh.metadata
+    existing.sessionID = fresh.sessionID
+    existing.messageID = fresh.messageID
+    return "updated"
+  }
+  message.parts.push(makeReminderPart(anchor, message.info.sessionID ?? "", mode, contextID))
   return "added"
 }
 

@@ -165,6 +165,7 @@ export type PermissionRule = {
 export type ReviewExecutionContext = {
   agent: ReviewAgent
   childPermissions: PermissionRule[]
+  dispatchParentID: string
 }
 
 export type ReviewCompletion =
@@ -213,6 +214,7 @@ type ReviewSessionApi = {
 type ReviewClient = {
   session: ReviewSessionApi
   app: { agents(input?: { signal?: AbortSignal }): Promise<ApiResponse> }
+  provider: { list(input?: { signal?: AbortSignal }): Promise<ApiResponse> }
 }
 
 function reviewClient(client: Client): ReviewClient {
@@ -316,7 +318,7 @@ function findAgent(rawAgents: unknown[], name: string, label: "caller" | "review
   return { ok: true, value: found }
 }
 
-type DispatchInfo = { model?: ReviewAgent["model"]; variant?: string }
+type DispatchInfo = { model?: ReviewAgent["model"]; variant?: string; parentID: string }
 type DispatchLookup = { ok: true; value: DispatchInfo } | { ok: false; reason: string }
 
 function parseDispatchMessage(raw: unknown, parentID: string, messageID: string): DispatchLookup {
@@ -327,7 +329,7 @@ function parseDispatchMessage(raw: unknown, parentID: string, messageID: string)
   if (info.id !== messageID || info.sessionID !== parentID) {
     return apiFailure("sdk: review context dispatch message returned unexpected data")
   }
-  if (info.role !== "user" && info.role !== "assistant") {
+  if (info.role !== "assistant" || !isNonEmptyString(info.parentID)) {
     return apiFailure("sdk: review context dispatch message returned unexpected data")
   }
 
@@ -365,7 +367,72 @@ function parseDispatchMessage(raw: unknown, parentID: string, messageID: string)
     }
     variant = info.variant
   }
-  return { ok: true, value: { model, variant } }
+  return { ok: true, value: { model, variant, parentID: info.parentID } }
+}
+
+function parseReviewerModel(value: unknown): ReviewAgent["model"] | null {
+  if (typeof value !== "string") return null
+  const segments = value.split("/")
+  if (segments.length < 2 || segments.some((segment) => segment.length === 0 || /\s/.test(segment))) return null
+  return { providerID: segments[0]!, modelID: segments.slice(1).join("/") }
+}
+
+type ProviderCatalog = {
+  providers: Map<string, Map<string, string>>
+  connected: Set<string>
+}
+
+function parseProviderCatalog(value: unknown): ProviderCatalog | null {
+  if (!isRecord(value) || !Array.isArray(value.all) || !Array.isArray(value.connected)) return null
+  const providers = new Map<string, Map<string, string>>()
+  for (const rawProvider of value.all) {
+    if (!isRecord(rawProvider) || !isNonEmptyString(rawProvider.id) || !isRecord(rawProvider.models)) return null
+    if (providers.has(rawProvider.id)) return null
+    const models = new Map<string, string>()
+    for (const [modelKey, rawModel] of Object.entries(rawProvider.models)) {
+      if (!isRecord(rawModel) || !isNonEmptyString(rawModel.id)) return null
+      models.set(modelKey, rawModel.id)
+    }
+    providers.set(rawProvider.id, models)
+  }
+
+  const connected = new Set<string>()
+  for (const providerID of value.connected) {
+    if (!isNonEmptyString(providerID) || connected.has(providerID)) return null
+    connected.add(providerID)
+  }
+  return { providers, connected }
+}
+
+async function validateReviewerModel(
+  api: ReviewClient,
+  model: ReviewAgent["model"],
+  signal: AbortSignal,
+): Promise<SdkResult<null>> {
+  if (signal.aborted) return apiFailure("sdk: review context aborted")
+  try {
+    const result = await api.provider.list({ signal })
+    if (signal.aborted) return apiFailure("sdk: review context aborted")
+    if (apiRejected(result)) {
+      return apiFailure("config: review.reviewer.model could not be verified against connected providers")
+    }
+    const catalog = parseProviderCatalog(result.data)
+    if (catalog === null) {
+      return apiFailure("config: review.reviewer.model could not be verified against connected providers")
+    }
+    const models = catalog.providers.get(model.providerID)
+    if (
+      !catalog.connected.has(model.providerID) ||
+      models === undefined ||
+      models.get(model.modelID) !== model.modelID
+    ) {
+      return apiFailure("config: review.reviewer.model is not available from a connected provider")
+    }
+    return { ok: true, value: null }
+  } catch {
+    if (signal.aborted) return apiFailure("sdk: review context aborted")
+    return apiFailure("config: review.reviewer.model could not be verified against connected providers")
+  }
 }
 
 function validReviewAgent(agent: ReviewAgent): boolean {
@@ -386,6 +453,7 @@ export async function readReviewExecutionContext(
     messageID: string
     callerAgent: string
     reviewerAgent: string
+    model?: string
   },
   signal: AbortSignal,
 ): Promise<SdkResult<ReviewExecutionContext>> {
@@ -396,6 +464,10 @@ export async function readReviewExecutionContext(
     !isNonEmptyString(input.reviewerAgent)
   ) {
     return apiFailure("sdk: review context invalid input")
+  }
+  const explicitModel = input.model === undefined ? undefined : parseReviewerModel(input.model)
+  if (explicitModel === null) {
+    return apiFailure("config: review.reviewer.model must be provider/model-id without whitespace")
   }
   if (signal.aborted) return apiFailure("sdk: review context aborted")
 
@@ -429,13 +501,16 @@ export async function readReviewExecutionContext(
     const dispatch = parseDispatchMessage(messageResult.data, input.parentID, input.messageID)
     if (!dispatch.ok) return dispatch
 
-    let model = reviewer.value.model
-    let variant = reviewer.value.variant
+    let model = explicitModel
+    let variant: string | undefined
     if (model === undefined) {
       model = dispatch.value.model
-      if (variant === undefined) variant = dispatch.value.variant
+      variant = dispatch.value.variant
     }
     if (model === undefined) return apiFailure("sdk: review context dispatch model missing")
+
+    const modelAvailable = await validateReviewerModel(api, model, signal)
+    if (!modelAvailable.ok) return modelAvailable
 
     const sessionResult = await api.session.get({ path: { id: input.parentID }, signal })
     if (signal.aborted) return apiFailure("sdk: review context aborted")
@@ -455,7 +530,14 @@ export async function readReviewExecutionContext(
       model,
       ...(variant === undefined ? {} : { variant }),
     }
-    return { ok: true, value: { agent, childPermissions: withFinalDeny(restrictions) } }
+    return {
+      ok: true,
+      value: {
+        agent,
+        childPermissions: withFinalDeny(restrictions),
+        dispatchParentID: dispatch.value.parentID,
+      },
+    }
   } catch {
     return apiFailure("sdk: review context failed")
   }

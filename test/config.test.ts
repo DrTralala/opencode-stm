@@ -116,6 +116,7 @@ test("partial file fills omitted fields from defaults", () => {
 
 test("config.example.yaml disables title reviews and historical access", () => {
   const text = readFileSync(new URL("../../config.example.yaml", import.meta.url), "utf8")
+  assert.match(text, /^  # reviewer:\n  #   model: provider\/model-id\n  #   timeoutSeconds: 120$/m)
   assert.deepEqual(parseConfigText(text), { ok: true, config: TEMPLATE_CONFIG, path: null })
   assert.deepEqual(parseConfigText(text), parseConfigText(""))
 })
@@ -137,87 +138,58 @@ test("explicit review enablement overrides the disabled default", () => {
   }
 })
 
-test("reviewer is opt-in and nested defaults are independent", () => {
+test("reviewer is opt-in and empty forms select the built-in reviewer", () => {
   const disabled = parseConfigText("")
   assert.equal(disabled.ok && disabled.config.review.reviewer, undefined)
-  const enabled = parseConfigText("review:\n  reviewer:\n    agent: title-worker\n")
-  assert.equal(enabled.ok, true)
-  if (!enabled.ok) return
-  assert.deepEqual(enabled.config.review.reviewer, {
-    agent: "title-worker",
-    timeoutSeconds: 120,
-    transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 },
-  })
+  for (const yaml of ["review:\n  reviewer:\n", "review:\n  reviewer: null\n", "review:\n  reviewer: {}\n"]) {
+    const result = parseConfigText(yaml)
+    assert.equal(result.ok, true, yaml)
+    if (result.ok) assert.deepEqual(result.config.review.reviewer, { timeoutSeconds: 120 }, yaml)
+  }
 })
 
-test("reviewer rejects malformed mappings and invalid values", () => {
-  const cases = [
-    {
-      name: "null reviewer",
-      yaml: "review:\n  reviewer:\n",
-      reason: /^config: review\.reviewer must be a mapping$/,
-    },
-    {
-      name: "list reviewer",
-      yaml: "review:\n  reviewer:\n    - agent: title-worker\n",
-      reason: /^config: review\.reviewer must be a mapping$/,
-    },
-    {
-      name: "missing agent",
-      yaml: "review:\n  reviewer:\n    timeoutSeconds: 30\n",
-      reason: /^config: review\.reviewer\.agent must be a non-empty string$/,
-    },
-    {
-      name: "blank agent",
-      yaml: 'review:\n  reviewer:\n    agent: "   "\n',
-      reason: /^config: review\.reviewer\.agent must be a non-empty string$/,
-    },
-    {
-      name: "non-string agent",
-      yaml: "review:\n  reviewer:\n    agent: [PRIVATE_AGENT_NAME]\n",
-      reason: /^config: review\.reviewer\.agent must be a non-empty string$/,
-      forbidden: "PRIVATE_AGENT_NAME",
-    },
-    {
-      name: "unknown reviewer key",
-      yaml: "review:\n  reviewer:\n    agent: title-worker\n    extra: true\n",
-      reason: /^config: unknown key review\.reviewer\.extra$/,
-    },
-    {
-      name: "null transcript",
-      yaml: "review:\n  reviewer:\n    agent: title-worker\n    transcript:\n",
-      reason: /^config: review\.reviewer\.transcript must be a mapping$/,
-    },
-    {
-      name: "list transcript",
-      yaml: "review:\n  reviewer:\n    agent: title-worker\n    transcript:\n      - includeToolCalls: true\n",
-      reason: /^config: review\.reviewer\.transcript must be a mapping$/,
-    },
-    {
-      name: "unknown transcript key",
-      yaml: "review:\n  reviewer:\n    agent: title-worker\n    transcript:\n      toolCalls: true\n",
-      reason: /^config: unknown key review\.reviewer\.transcript\.toolCalls$/,
-    },
-    {
-      name: "non-boolean includeToolCalls",
-      yaml:
-        "review:\n  reviewer:\n    agent: title-worker\n    transcript:\n      includeToolCalls: PRIVATE_SCOPE\n",
-      reason: /^config: review\.reviewer\.transcript\.includeToolCalls must be a boolean$/,
-      forbidden: "PRIVATE_SCOPE",
-    },
-    {
-      name: "non-boolean includeToolResults",
-      yaml:
-        "review:\n  reviewer:\n    agent: title-worker\n    transcript:\n      includeToolResults: 0\n",
-      reason: /^config: review\.reviewer\.transcript\.includeToolResults must be a boolean$/,
-    },
-  ]
-  for (const entry of cases) {
-    const result = parseConfigText(entry.yaml)
-    assert.equal(result.ok, false, entry.name)
-    if (result.ok) continue
-    assert.match(result.reason, entry.reason, entry.name)
-    if (entry.forbidden !== undefined) assert.equal(result.reason.includes(entry.forbidden), false, entry.name)
+test("reviewer accepts an exact provider/model setting with nested model ids", () => {
+  const result = parseConfigText("review:\n  reviewer:\n    model: provider/family/model-id\n    timeoutSeconds: 30\n")
+  assert.equal(result.ok, true)
+  if (result.ok) assert.deepEqual(result.config.review.reviewer, { model: "provider/family/model-id", timeoutSeconds: 30 })
+})
+
+test("reviewer rejects non-mappings and unknown current settings", () => {
+  for (const yaml of [
+    "review:\n  reviewer:\n    - timeoutSeconds: 30\n",
+    "review:\n  reviewer:\n    extra: true\n",
+  ]) {
+    const result = parseConfigText(yaml)
+    assert.equal(result.ok, false, yaml)
+    if (!result.ok) assert.match(result.reason, /review\.reviewer/, yaml)
+  }
+})
+
+test("reviewer rejects malformed model settings and obsolete agent/transcript options", () => {
+  for (const model of ["", "   ", "provider", "/model", "provider/", "provider//model", "provider/model id", " provider/model"]) {
+    const result = parseConfigText(`review:\n  reviewer:\n    model: ${JSON.stringify(model)}\n`)
+    assert.equal(result.ok, false, `model ${JSON.stringify(model)}`)
+    if (!result.ok) assert.match(result.reason, /review\.reviewer\.model/, `model ${JSON.stringify(model)}`)
+  }
+  for (const yamlValue of ["null", "2", "true"]) {
+    const result = parseConfigText(`review:\n  reviewer:\n    model: ${yamlValue}\n`)
+    assert.equal(result.ok, false, `model ${yamlValue}`)
+    if (!result.ok) assert.match(result.reason, /review\.reviewer\.model/, `model ${yamlValue}`)
+  }
+
+  for (const obsolete of [
+    "agent: title-worker",
+    "transcript: {}",
+    "includeToolCalls: true",
+    "includeToolResults: true",
+    "maxBytes: 131072",
+  ]) {
+    const result = parseConfigText(`review:\n  reviewer:\n    ${obsolete}\n`)
+    assert.equal(result.ok, false, obsolete)
+    if (!result.ok) {
+      assert.match(result.reason, /review\.reviewer\./, obsolete)
+      assert.match(result.reason, /obsolete|unsupported|remove/i, obsolete)
+    }
   }
 })
 
@@ -231,7 +203,7 @@ test("reviewer timeoutSeconds accepts only integers from 10 to 600", () => {
   ]
   for (const entry of cases) {
     const result = parseConfigText(
-      `review:\n  reviewer:\n    agent: title-worker\n    timeoutSeconds: ${entry.value}\n`,
+      `review:\n  reviewer:\n    timeoutSeconds: ${entry.value}\n`,
     )
     assert.equal(result.ok, entry.accepted, `timeoutSeconds: ${entry.value}`)
     if (!result.ok) {
@@ -239,98 +211,33 @@ test("reviewer timeoutSeconds accepts only integers from 10 to 600", () => {
       assert.equal(result.reason.includes(entry.value), false, `timeoutSeconds: ${entry.value}`)
       continue
     }
-    assert.equal(
-      result.config.review.reviewer?.timeoutSeconds,
-      Number(entry.value),
-      `timeoutSeconds: ${entry.value}`,
-    )
+    assert.equal(result.config.review.reviewer?.timeoutSeconds, Number(entry.value), `timeoutSeconds: ${entry.value}`)
   }
 })
 
-test("reviewer transcript maxBytes accepts only integers from 4096 to 1048576", () => {
-  const cases = [
-    { value: "4095", accepted: false },
-    { value: "4096", accepted: true },
-    { value: "1048576", accepted: true },
-    { value: "1048577", accepted: false },
-    { value: "true", accepted: false },
-  ]
-  for (const entry of cases) {
-    const result = parseConfigText(
-      `review:\n  reviewer:\n    agent: title-worker\n    transcript:\n      maxBytes: ${entry.value}\n`,
-    )
-    assert.equal(result.ok, entry.accepted, `maxBytes: ${entry.value}`)
-    if (!result.ok) {
-      assert.match(result.reason, /review\.reviewer\.transcript\.maxBytes/, `maxBytes: ${entry.value}`)
-      assert.equal(result.reason.includes(entry.value), false, `maxBytes: ${entry.value}`)
-      continue
-    }
-    assert.equal(
-      result.config.review.reviewer?.transcript.maxBytes,
-      Number(entry.value),
-      `maxBytes: ${entry.value}`,
-    )
-  }
-})
-
-test("reviewer transcript tool toggles are independent", () => {
-  const cases = [
-    { yaml: "      maxBytes: 8192\n", includeToolCalls: false, includeToolResults: false },
-    { yaml: "      includeToolCalls: true\n", includeToolCalls: true, includeToolResults: false },
-    { yaml: "      includeToolResults: true\n", includeToolCalls: false, includeToolResults: true },
-    {
-      yaml: "      includeToolCalls: true\n      includeToolResults: true\n",
-      includeToolCalls: true,
-      includeToolResults: true,
-    },
-  ]
-  for (const entry of cases) {
-    const result = parseConfigText(
-      `review:\n  reviewer:\n    agent: title-worker\n    transcript:\n${entry.yaml}`,
-    )
-    assert.equal(result.ok, true)
-    if (!result.ok) continue
-    const transcript = result.config.review.reviewer?.transcript
-    assert.equal(transcript?.includeToolCalls, entry.includeToolCalls)
-    assert.equal(transcript?.includeToolResults, entry.includeToolResults)
-  }
-})
-
-test("reviewer agent names are trimmed", () => {
-  const result = parseConfigText('review:\n  reviewer:\n    agent: "  title-worker  "\n')
-  assert.equal(result.ok, true)
-  if (!result.ok) return
-  assert.equal(result.config.review.reviewer?.agent, "title-worker")
-})
-
-test("mutating one parsed reviewer does not change another or the defaults", () => {
-  const yaml = "review:\n  reviewer:\n    agent: title-worker\n"
+test("mutating one parsed reviewer does not change another", () => {
+  const yaml = "review:\n  reviewer:\n    model: provider/model-id\n"
   const first = parseConfigText(yaml)
   const second = parseConfigText(yaml)
   if (!first.ok || !second.ok) assert.fail("reviewer configuration did not parse")
   assert.ok(first.config.review.reviewer)
   assert.deepEqual(second.config.review.reviewer, {
-    agent: "title-worker",
+    model: "provider/model-id",
     timeoutSeconds: 120,
-    transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 },
   })
 
-  first.config.review.reviewer.agent = "changed"
+  first.config.review.reviewer.model = "other/model-id"
   first.config.review.reviewer.timeoutSeconds = 10
-  first.config.review.reviewer.transcript.includeToolCalls = true
-  first.config.review.reviewer.transcript.maxBytes = 4096
 
   assert.deepEqual(second.config.review.reviewer, {
-    agent: "title-worker",
+    model: "provider/model-id",
     timeoutSeconds: 120,
-    transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 },
   })
   const third = parseConfigText(yaml)
   if (!third.ok) assert.fail("reviewer configuration did not parse")
   assert.deepEqual(third.config.review.reviewer, {
-    agent: "title-worker",
+    model: "provider/model-id",
     timeoutSeconds: 120,
-    transcript: { includeToolCalls: false, includeToolResults: false, maxBytes: 131072 },
   })
   const disabled = parseConfigText("")
   assert.equal(disabled.ok && disabled.config.review.reviewer, undefined)

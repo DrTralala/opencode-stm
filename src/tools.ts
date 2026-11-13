@@ -6,6 +6,7 @@ import { page, readSession, writeTitle, type Client, type RootCache } from "./sd
 import { ENVELOPE_BUDGET_REASON, extractVisibleText, type SupplyResult, type TranscriptPager } from "./transcript.js"
 import { firstObservation, isDefaultTitle, lockExternal, lockManually, resolveReview, unlock } from "./scheduler.js"
 import type { BackgroundReviewer } from "./background-review.js"
+import type { ReviewSnapshots } from "./review-input.js"
 import { REVIEW_REVOCATION_REASONS, revokeReview } from "./background-state.js"
 import { TITLE_MAX_CODE_POINTS, validateTitle, type TitleValidation } from "./title.js"
 
@@ -19,6 +20,7 @@ export type StmServices = {
   state: StateStore
   transcripts: TranscriptPager
   roots: RootCache
+  reviewSnapshots?: ReviewSnapshots
   guard: OperationGuard
   blocked: Map<string, Set<string>>
   now: () => number
@@ -39,6 +41,7 @@ export function createBackgroundTools(services: StmServices): Record<string, Too
       args: {
         reviewID: tool.schema.string(),
         expectedTitle: tool.schema.string(),
+        contextID: tool.schema.string(),
         retry: tool.schema.optional(tool.schema.boolean()),
       },
       async execute(args, context) {
@@ -46,6 +49,7 @@ export function createBackgroundTools(services: StmServices): Record<string, Too
           {
             reviewID: args.reviewID,
             expectedTitle: args.expectedTitle,
+            contextID: args.contextID,
             ...(args.retry === undefined ? {} : { retry: args.retry }),
           },
           context,
@@ -131,34 +135,108 @@ export async function establishBaseline(
   return { ok: true, meta: updated.value }
 }
 
+type ReconciledTitleRead =
+  | { ok: true; title: string; meta: SessionMeta; externalChange: boolean }
+  | { ok: false; status: "aborted" | "error" | "state-unavailable" }
+
+async function reconcileCurrentTitleRead(
+  services: StmServices,
+  sessionID: string,
+  signal: AbortSignal,
+): Promise<ReconciledTitleRead> {
+  return services.guard.run(sessionID, async () => {
+    if (signal.aborted) return { ok: false, status: "aborted" }
+    const read = await readSession(services.client, sessionID, signal)
+    if (signal.aborted) return { ok: false, status: "aborted" }
+    if (!read.ok) return { ok: false, status: "error" }
+
+    // Decide against the latest persisted metadata while holding both the
+    // operation guard and the state store's atomic update. This preserves a
+    // concurrent lock or unlock instead of acting on a stale pre-read snapshot.
+    const digest = hashTitle(read.value.title)
+    const saved = await services.state.update(sessionID, (current) => {
+      if (current === null) {
+        const meta = firstObservation(isDefaultTitle(read.value.title), digest)
+        return { next: meta, result: { meta, externalChange: false } }
+      }
+      if (current.locked || current.titleDigest === null || current.titleDigest === digest) {
+        return { next: current, result: { meta: current, externalChange: false } }
+      }
+      const meta = lockExternal(current)
+      return { next: meta, result: { meta, externalChange: true } }
+    })
+    if (!saved.ok) return { ok: false, status: "state-unavailable" }
+    return {
+      ok: true,
+      title: read.value.title,
+      meta: saved.value.meta,
+      externalChange: saved.value.externalChange,
+    }
+  })
+}
+
+function readGuidance(canRename: boolean): string {
+  if (canRename) {
+    return "Rename eligibility is advisory only; permission, expected-title and lock checks still apply, and a later rename is not guaranteed to succeed."
+  }
+  return "The session is locked. Do not retry or unlock automatically. Only a user-authorised, normally permitted unlock followed by re-reading the live title and state can precede a fresh rename; omit any review ID cleared by unlocking. Automatic periodic reviews must stop and never unlock to proceed."
+}
+
+function lockedRenameResult(
+  resultStatus: "locked" | "conflict",
+  reason: string,
+  lockReason: SessionMeta["lockReason"],
+): string {
+  return status({
+    status: resultStatus,
+    reason,
+    lockReason,
+    renamed: false,
+    canRename: false,
+    guidance: readGuidance(false),
+  })
+}
+
+function permissionDeniedResult(): string {
+  return status({
+    status: "denied",
+    guidance: "Permission was denied. Stop; do not retry through another tool or route.",
+  })
+}
+
 export function createCurrentTools(services: StmServices): Record<string, ToolDefinition> {
   const titleRead = tool({
-    description: "Read the current session title, lock state and pending title review ID.",
+    description:
+      "Read the current session title, lock state and pending title review ID before considering a rename. Rename eligibility is advisory only; it does not reserve permission or eliminate later conflict checks.",
     args: {},
     async execute(_args, context) {
       if (context.abort.aborted) return status({ status: "aborted" })
       const caller = await requireCaller(services, context)
       if (!caller.ok) return status({ status: caller.status })
-      const read = await readSession(services.client, context.sessionID, context.abort)
-      if (!read.ok) return status({ status: "error" })
-      const baseline = await establishBaseline(services, context.sessionID, context.abort, read.value.title)
-      if (!baseline.ok) return status({ status: "state-unavailable" })
-      const shown = titleForStatus(read.value.title)
+      const reconciled = await reconcileCurrentTitleRead(services, context.sessionID, context.abort)
+      if (!reconciled.ok) return status({ status: reconciled.status })
+      if (reconciled.externalChange) {
+        await cancelBackgroundReview(services, context.sessionID, REVIEW_REVOCATION_REASONS.externalTitleChange)
+      }
+      const shown = titleForStatus(reconciled.title)
+      const canRename = !reconciled.meta.locked
       return status({
         status: "ok",
         sessionID: context.sessionID,
         title: shown.value,
         titleTruncated: shown.truncated,
-        locked: baseline.meta.locked,
-        lockReason: baseline.meta.lockReason,
-        reviewID: baseline.meta.review?.id ?? null,
+        locked: reconciled.meta.locked,
+        lockReason: reconciled.meta.lockReason,
+        reviewID: reconciled.meta.review?.id ?? null,
+        canRename,
+        guidance: readGuidance(canRename),
       })
     },
   })
 
   const titleReview = tool({
     description:
-      "Resolve the current title review, or apply an explicit keep/rename decision. Keep requires no title; rename requires a new title.",
+      "Read stm_title_read first to inspect the current title and lock state. Resolve the current title review, or apply an explicit keep/rename decision. Keep requires no title; rename requires a new title and an unlocked session. If locked, do not retry or unlock automatically: only after user authorisation and normal stm_title_lock permission, unlock, re-read the live title and state, then submit a fresh rename without any review ID cleared by unlocking.",
     args: {
       decision: tool.schema.enum(["keep", "rename"]),
       expectedTitle: tool.schema.string(),
@@ -207,21 +285,30 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
         // unlock is preserved and an already-locked state is never overwritten.
         const external = await services.guard.run(
           context.sessionID,
-          async (): Promise<{ ok: true; locked: boolean } | { ok: false; status: "aborted" | "error" | "uncertain" }> => {
+          async (): Promise<
+            | { ok: true; locked: boolean; lockReason: SessionMeta["lockReason"]; newlyLocked: boolean }
+            | { ok: false; status: "aborted" | "error" | "uncertain" }
+          > => {
             if (context.abort.aborted) return { ok: false, status: "aborted" }
             const read = await readSession(services.client, context.sessionID, context.abort)
             if (context.abort.aborted) return { ok: false, status: "aborted" }
             if (!read.ok) return { ok: false, status: "error" }
             const saved = await services.state.update(context.sessionID, (current) => {
               const base = current ?? meta
-              if (base.locked) return { next: base, result: true }
-              if (base.titleDigest === null || hashTitle(read.value.title) === base.titleDigest) {
-                return { next: base, result: false }
+              if (base.locked) {
+                return { next: base, result: { locked: true, lockReason: base.lockReason, newlyLocked: false } }
               }
-              return { next: lockExternal(base), result: true }
+              if (base.titleDigest === null || hashTitle(read.value.title) === base.titleDigest) {
+                return { next: base, result: { locked: false, lockReason: base.lockReason, newlyLocked: false } }
+              }
+              const locked = lockExternal(base)
+              return {
+                next: locked,
+                result: { locked: true, lockReason: locked.lockReason, newlyLocked: true },
+              }
             })
             if (!saved.ok) return { ok: false, status: "uncertain" }
-            return { ok: true, locked: saved.value }
+            return { ok: true, ...saved.value }
           },
         )
         if (!external.ok) {
@@ -229,7 +316,12 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
           if (external.status === "error") return status({ status: "error" })
           return status({ status: "uncertain", reason: "state-save-failed" })
         }
-        if (external.locked) return status({ status: "locked", reason: "external-title-change" })
+        if (external.locked) {
+          if (external.newlyLocked) {
+            await cancelBackgroundReview(services, context.sessionID, REVIEW_REVOCATION_REASONS.externalTitleChange)
+          }
+          return lockedRenameResult("locked", "external-title-change", external.lockReason)
+        }
       }
 
       if (args.decision === "keep") {
@@ -281,14 +373,16 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
         return status({ status: "ok", decision: "keep", reviewID: outcome.reviewID })
       }
 
-      if (meta.locked) return status({ status: "conflict", reason: "locked" })
+      if (meta.locked) return lockedRenameResult("conflict", "locked", meta.lockReason)
       if (newTitle === null) return status({ status: "error" })
 
       const approved = await askOrAbort(context, "stm_title_review", context.sessionID, {
         currentTitle,
         newTitle,
       })
-      if (!approved.ok) return status({ status: approved.status })
+      if (!approved.ok) {
+        return approved.status === "denied" ? permissionDeniedResult() : status({ status: approved.status })
+      }
 
       const outcome = await services.guard.run(context.sessionID, async () => {
         const before = await readSession(services.client, context.sessionID, context.abort)
@@ -301,7 +395,9 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
         if (context.abort.aborted) return { outcome: "aborted" as const }
         if (!latest.ok) return { outcome: "state-unavailable" as const }
         const effective = latest.value ?? meta
-        if (effective.locked) return { outcome: "conflict" as const, reason: "locked" as const }
+        if (effective.locked) {
+          return { outcome: "conflict" as const, reason: "locked" as const, lockReason: effective.lockReason }
+        }
         // Revalidate the caller-provided review ID against the latest state: a
         // review resolved or replaced while the ask was pending must conflict
         // instead of writing a title for a review the caller never saw.
@@ -335,6 +431,9 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
       })
       if (outcome.outcome !== "renamed") {
         if (outcome.outcome === "conflict") {
+          if (outcome.reason === "locked") {
+            return lockedRenameResult("conflict", "locked", outcome.lockReason ?? "unreadable-state")
+          }
           return status({ status: "conflict", reason: "reason" in outcome ? outcome.reason : "expected-title-mismatch" })
         }
         return "reason" in outcome
@@ -347,7 +446,8 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
   })
 
   const titleLock = tool({
-    description: "Lock (pause) or unlock periodic title reviews for the current session.",
+    description:
+      "Lock or unlock the current session. Locking pauses periodic reviews and blocks current-session renames. Unlocking requires normal permission, clears the pending review ID and resets the scheduling baseline; periodic reviews may resume when enabled by configuration.",
     args: { locked: tool.schema.boolean(), expectedTitle: tool.schema.string() },
     async execute(args, context) {
       if (context.abort.aborted) return status({ status: "aborted" })
@@ -356,7 +456,9 @@ export function createCurrentTools(services: StmServices): Record<string, ToolDe
       const loaded = await services.state.load(context.sessionID)
       if (!loaded.ok) return status({ status: "state-unavailable" })
       const approved = await askOrAbort(context, "stm_title_lock", context.sessionID, {})
-      if (!approved.ok) return status({ status: approved.status })
+      if (!approved.ok) {
+        return approved.status === "denied" ? permissionDeniedResult() : status({ status: approved.status })
+      }
       // Serialise the whole read-check-mutate sequence with rename's guarded
       // read-check-write. The title must be read inside the guard: a rename that
       // held the guard may have changed it while this call was queued, and the

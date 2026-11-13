@@ -58,13 +58,16 @@ test("compiled plugin dispatches asynchronously, keeps the parent moving and app
       assert.equal(typeof receipts.promptMessageID, "string")
       assert.equal(receipts.stateAtDispatch.backgroundReview?.phase, "active")
       assert.equal(receipts.stateAtDispatch.backgroundReview?.reviewID !== null, true)
+      assert.equal(receipts.dispatchAssistantVariant, "high")
+      assert.match(receipts.dispatchContextID, /^[0-9a-f-]{36}$/)
+      assert.equal(receipts.toolContextID, receipts.dispatchContextID)
 
       const childSession = await host.client.session.get({
         path: { id: receipts.childID },
         query: { directory: host.directory },
       })
       assert.equal(childSession.error, undefined)
-      assert.equal(childSession.data?.agent, "stm-probe-reviewer")
+      assert.equal(childSession.data?.agent, "session-title-reviewer")
       assert.deepEqual(childSession.data?.permission, [
         { permission: "*", pattern: "*", action: "deny" },
       ])
@@ -123,7 +126,7 @@ test("compiled plugin dispatches asynchronously, keeps the parent moving and app
       )
       assert.equal(childAssistant?.info?.variant, "high")
     },
-    { compiledPlugin: true, reviewerVariant: "high" },
+    { compiledPlugin: true, callerVariant: "high" },
   )
 })
 
@@ -149,37 +152,88 @@ test("compiled plugin denies start, task and review permission before any child 
   )
 })
 
-test("compiled plugin honours transcript tool opt-ins and applies a keep", async (t) => {
+test("compiled plugin gives its built-in reviewer retained summary text only", async (t) => {
   await withLoopbackHost(
     t,
     async (host) => {
       const held = host.holdReviewer()
       const receipts = await host.dispatchViaMain()
       const reviewerRequest = await held
+      // This fixture replaces one outgoing marker before STM's transform hook;
+      // it checks retained-snapshot capture at that boundary, not host compaction.
       assert.equal(reviewerRequest.kind, "review-child")
-      assert.equal(reviewerRequest.promptHasToolCallRecords, true)
-      assert.equal(reviewerRequest.promptHasToolResultRecords, true)
-      assert.match(reviewerRequest.marker, /stm_title_lock/)
+      assert.equal(reviewerRequest.requestModel, "mock")
+      assert.deepEqual(reviewerRequest.toolNames, [])
+      assert.equal(reviewerRequest.toolChoice, null)
+      assert.equal(reviewerRequest.systemMentionsStructuredOutput, false)
+      assert.equal(reviewerRequest.promptHasToolCallRecords, false)
+      assert.equal(reviewerRequest.promptHasToolResultRecords, false)
+      assert.equal(reviewerRequest.marker.includes("STM_BACKGROUND_REVIEW_ORIGINAL_HISTORY_PROBE"), false)
+      assert.equal(reviewerRequest.marker.includes("STM_BACKGROUND_REVIEW_RETAINED_SUMMARY_PROBE"), true)
+
+      const dispatchRequest = host.requests.find((request) => request.kind === "background-dispatch")
+      assert.equal(dispatchRequest?.containsOriginalHistoryMarker, false)
+      assert.equal(dispatchRequest?.containsRetainedSummaryMarker, true)
 
       host.releaseReviewer({ decision: "keep" })
       const resolved = await host.waitForReviewerResolution(receipts.titleBefore)
       assert.equal(resolved.title, receipts.titleBefore)
     },
-    { compiledPlugin: true, includeToolCalls: true, includeToolResults: true },
+    { compiledPlugin: true, retainedSummaryFixture: true },
   )
 })
 
-test("compiled plugin fails closed when the configured reviewer agent is unavailable", async (t) => {
+test("compiled plugin rejects an unavailable reviewer model without falling back", async (t) => {
   await withLoopbackHost(
     t,
     async (host) => {
       const receipts = await host.dispatchViaMain()
       assert.equal(receipts.dispatchStatus.status, "disabled")
-      assert.equal(receipts.dispatchStatus.reason, "reviewer-unavailable")
+      assert.equal(
+        receipts.dispatchStatus.reason,
+        "config: review.reviewer.model is not available from a connected provider",
+      )
       assert.equal(receipts.stateAtDispatch.backgroundReview, null)
       assert.equal(host.requests.filter((request) => request.kind === "review-child").length, 0)
     },
-    { compiledPlugin: true, reviewerAgent: "stm-missing-reviewer" },
+    { compiledPlugin: true, reviewerModel: "probe/missing" },
+  )
+})
+
+test("compiled plugin uses the registered reviewer with an explicit model override", async (t) => {
+  await withLoopbackHost(
+    t,
+    async (host) => {
+      const held = host.holdReviewer()
+      const receipts = await host.dispatchViaMain()
+      const reviewerRequest = await held
+
+      assert.equal(receipts.dispatchStatus.status, "queued")
+      assert.equal(reviewerRequest.kind, "review-child")
+      assert.equal(reviewerRequest.model, "reviewer")
+      assert.deepEqual(reviewerRequest.toolNames, [])
+
+      const activeState = await host.waitForState(
+        receipts.parentID,
+        (state) => typeof state.backgroundReview?.childSessionID === "string",
+      )
+      const childSession = await host.client.session.get({
+        path: { id: activeState.backgroundReview.childSessionID },
+        query: { directory: host.directory },
+      })
+      assert.equal(childSession.error, undefined)
+      assert.equal(childSession.data?.agent, "session-title-reviewer")
+      assert.deepEqual(childSession.data?.model, {
+        id: "reviewer",
+        providerID: "probe",
+        variant: "default",
+      })
+
+      host.releaseReviewer({ decision: "keep" })
+      const resolved = await host.waitForReviewerResolution(receipts.titleBefore)
+      assert.equal(resolved.title, receipts.titleBefore)
+    },
+    { compiledPlugin: true, reviewerModel: "probe/reviewer" },
   )
 })
 
@@ -239,7 +293,7 @@ test("compiled plugin manual lock revokes a held reviewer and blocks its rename"
   )
 })
 
-test("compiled plugin does not let a permissive reviewer bypass restrictive parent permissions", async (t) => {
+test("compiled plugin carries restrictive parent permissions into the reviewer child", async (t) => {
   await withLoopbackHost(
     t,
     async (host) => {
@@ -271,7 +325,7 @@ test("compiled plugin does not let a permissive reviewer bypass restrictive pare
         { permission: "*", pattern: "*", action: "deny" },
       ])
     },
-    { compiledPlugin: true, reviewerAgent: "stm-probe-reviewer-permissive" },
+    { compiledPlugin: true },
   )
 })
 
