@@ -1,132 +1,60 @@
 # opencode-stm
 
 [![Version](https://img.shields.io/github/v/release/DrTralala/opencode-stm?label=version&color=blue&sort=date&style=flat-square)](https://github.com/DrTralala/opencode-stm/releases/latest)
+[![Licence](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 
-A session title manager for OpenCode, driven by the agent already working in the conversation.
+A session-title manager for OpenCode. The agent already working in a conversation can inspect, keep, or rename that session's title; activity-based reminders and access to other sessions are opt-in.
 
-## Status
+**Quick links:** [Quick start](#quick-start) · [Activity reminders](#activity-based-reminders) · [Background reviewer](#optional-background-reviewer) · [Historical access](#historical-session-access) · [Privacy and safety](#privacy-and-safety) · [Build and validation](#build-validation-and-compatibility)
 
-Version 0.6.0. STM now registers its own background title-review subagent, with an optional model selected in STM's `config.yaml`. The main agent dispatches a pending review using retained conversation text, and STM applies the reviewer's strict keep/rename decision without adding its text to the parent conversation. This configuration replaces the earlier external-agent setup; see migration guidance below. Current-session title tools also provide read-first, lock-aware rename guidance.
+## Quick start
 
-The published 0.2.1 build's validation remains historical and does not cover the newer direct-result code. On Node.js 24, its `npm run typecheck` and full test suite (262 tests) passed against the OpenCode 1.18.35 SDK, and live loopback runs of the production build against fake OpenAI-wire providers recorded: Responses wire 33 assertions in the plugin-only phase and 35 with an observer wrapper, chat-completions 46 assertions, and the pinned DCP 3.2.0 plugin in both orders 23 assertions each; all passed. All runs used isolated homes and loopback fake providers only. The 0.3.0 direct-result code passed typecheck and 275 tests using the fake SDK. The 0.3.1 attributed-history code passed typecheck and 288 tests, including consecutive-user and interrupted-response regressions. The 0.4.0 subagent changes are covered by fake-SDK regression tests for own-session targeting, historical permissions and caller isolation; no new live-wire or paid-provider validation was performed.
+Use OpenCode 1.18.35 for this setup; the package depends on the 1.18.35 plugin SDK. Compatibility evidence and its limits are described under [Build, validation, and compatibility](#build-validation-and-compatibility).
 
-The 0.4.1 cursorless-pagination changes have regression coverage for multi-page and partial-page reads, empty pages, explicit-cursor validation and recovery, and failed-read retries. This coverage uses the pager and fake SDK only; no new live-wire or paid-provider validation was performed.
+1. Add the plugin to the `plugin` array in your project or user `opencode.json` / `opencode.jsonc`:
 
-The current background reviewer has compiled-plugin loopback coverage against a local OpenCode 1.19.5 host with a fake OpenAI-compatible provider. It exercises runtime agent registration, asynchronous dispatch, a held reviewer while the parent continues, inherited model/variant, explicit model selection, unknown-model rejection, deny-all child permissions, permission denial, timeout, locking, duplicate dispatch and invalid output. A transform fixture verifies retained summary text and exclusion of replaced original text; it does not exercise native host compaction. This is not a paid-provider run and does not extend the version or wire-format compatibility claims above.
+   ```json
+   {
+     "plugin": ["opencode-stm@latest"]
+   }
+   ```
 
-Compatibility is claimed only for what the 0.2.1 loopback validation exercised: OpenCode 1.18.35 with chat-completions-style and OpenAI Responses-style provider wire formats against loopback fake providers. That evidence predates and does not cover the 0.3.x–0.5.x direct-result code or subagent/reviewer access, for which no provider-wire compatibility is claimed. No paid provider call was made, so the real OpenAI endpoint's exact handling remains unverified and no conclusion is extrapolated to Anthropic; no claim is made for other OpenCode versions, Anthropic, paid provider calls, or prompt-cache and billing behaviour.
+   If the array already contains plugins, add this entry without replacing the others. OpenCode resolves and installs npm plugins at startup; you do not need a global npm install. OpenCode 1.18.35 may reuse a cached `@latest` package on restart; pin `opencode-stm@X.Y.Z` (replace with the version you want) when you need a specific release.
+2. Restart OpenCode. On first startup STM creates its configuration file if it is missing; it does not overwrite an existing file.
+3. In an open conversation, ask your agent: “Use `stm_title_read` first. If this title needs changing, use `stm_title_review` with the current title as `expectedTitle` and ask me before applying a rename.”
 
-Reproduce the project checks with:
+The first tool result reports the live title and lock state. `canRename` is advisory, not permission; rename and keep decisions still follow OpenCode's normal permission policy.
 
-```sh
-npm test
-npm run typecheck
-```
+## Tools and defaults
 
-## Scope
+These current-session tools are available by default:
 
-- Agent-callable tools to read, review, rename and lock the current session's title.
-- Activity-based reminders for the agent to review the title during long tool-driven turns; the agent keeps the title or renames it through a permission-checked decision.
-- Conservative protection for manually edited titles, with an explicit unlock.
-- Separately opt-in tools for historical title reads, renames and bounded transcript review.
-- An opt-in background title reviewer owned by STM, with an optional model override.
+- `stm_title_read` reports the caller's live title, lock state, and any pending review.
+- `stm_title_review` explicitly keeps the title or renames it. Read first; a rename requires the current `expectedTitle` and a new title.
+- `stm_title_lock` locks or unlocks the current session. Locking pauses periodic reviews and prevents renames until a permitted unlock.
 
-It is not a session-deletion tool and not an automatic bulk-audit service. Default mode uses OpenCode's SDK without a separate title-generation model or idle background model calls. Reviewer mode adds one time-limited reviewer-child call only when the main agent dispatches a due review.
+Tools operate on the actual caller's session, including a subagent's own session. Automatic reminders are root-session only. The plugin does not start a separate title-generation model or idle model calls in its default mode.
 
-## Setup
+STM reads configuration once at startup. It creates a missing file from the packaged template at `$XDG_CONFIG_HOME/opencode/opencode-stm/config.yaml`, or `~/.config/opencode/opencode-stm/config.yaml` when `XDG_CONFIG_HOME` is unset, empty, or relative. Existing files are never overwritten. An invalid, unreadable, or uncreatable configuration disables the plugin with a diagnostic; restart OpenCode after changing configuration.
 
-### Install as an npm plugin (recommended)
+## Activity-based reminders
 
-Prerequisite: OpenCode 1.18.35. OpenCode resolves and installs configured npm plugins at startup, so a global npm install is not required.
-
-Add `opencode-stm@latest` to the `plugin` array in the OpenCode configuration (`opencode.json` or `opencode.jsonc` in the project directory or the user config directory):
-
-```json
-{
-  "plugin": ["opencode-stm@latest"]
-}
-```
-
-If the configuration already lists plugins, append the package instead of replacing the array.
-
-OpenCode 1.18.35 caches npm plugin installations and may reuse the cached `@latest` package instead of checking the registry on every restart, so `@latest` does not guarantee that a newly published version is picked up on the next restart. Pinning an explicit version (for example `opencode-stm@0.6.0`) is the cache-independent option when a specific release is required.
-
-Restart OpenCode afterwards. On first startup the plugin creates its configuration file if it is missing (see Configuration). The plugin is loaded once at startup; if its configuration file is present but invalid, the plugin disables itself and prints a single diagnostic: field-level errors name the offending setting, while YAML parse or file access errors stay generic. Raw values are never echoed.
-
-### Build from source (alternate)
-
-Prerequisite: Node.js 24 or newer and npm. From a source checkout of this repository:
-
-```sh
-npm install
-npm run build
-```
-
-Register the built entry point as a file plugin in the OpenCode configuration, using an absolute path to the built `dist/src/index.js`:
-
-```json
-{
-  "plugin": ["/absolute/path/to/opencode-stm/dist/src/index.js"]
-}
-```
-
-Restart OpenCode afterwards.
-
-## Configuration
-
-On first plugin startup, a missing configuration file is created automatically from the packaged template; no manual copy is needed. The destination is `$XDG_CONFIG_HOME/opencode/opencode-stm/config.yaml`, falling back to `~/.config/opencode/opencode-stm/config.yaml` when `XDG_CONFIG_HOME` is unset, empty or relative. The packaged template is `config.example.yaml` (for a project install, `node_modules/opencode-stm/config.example.yaml`). Every field is optional; omitted fields use the defaults shown here:
+Periodic reminders are disabled by default. To enable them, edit the generated `config.yaml` and set:
 
 ```yaml
 review:
-  enabled: false
-  intervalMessages: 20
-  maxReminders: 3
-  backoffMultiplier: 2
-  # reviewer:
-  #   model: provider/model-id
-  #   timeoutSeconds: 120
-
-historical:
-  readTitles: false
-  renameTitles: false
-  readTranscript: false
+  enabled: true
 ```
 
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| `review.enabled` | `false` | Periodic title reviews for root sessions |
-| `review.intervalMessages` | `20` | Eligible messages before the first reminder |
-| `review.maxReminders` | `3` | Maximum reminders per review |
-| `review.backoffMultiplier` | `2` | Multiplier between reminder thresholds |
-| `review.reviewer` | Absent | Opts into the built-in background reviewer when present; an empty block, `null` or `{}` uses its defaults |
-| `review.reviewer.model` | Inherit dispatch model and variant | Optional `provider/model-id`; an explicit model never falls back |
-| `review.reviewer.timeoutSeconds` | `120` | Integer 10–600 covering dispatch acceptance through result handling |
-| `historical.readTitles` | `false` | Exposes `stm_history_title_read` |
-| `historical.renameTitles` | `false` | Exposes `stm_history_title_rename` |
-| `historical.readTranscript` | `false` | Exposes `stm_history_transcript` and `stm_history_review_end` |
+With defaults, a root session receives its first reminder after 20 eligible messages, then at cumulative thresholds of 60 and 140 (up to three reminders). The active agent handles each review through `stm_title_read` and `stm_title_review`; reminders themselves do not dispatch another model.
 
-Periodic reviews are disabled both in generated configurations and when `review.enabled` is omitted, including in empty files. Set `review.enabled: true` to opt in; an existing explicit `true` remains enabled. Manual current-session title tools remain available.
+STM locks a session when it first encounters an unrecognised, non-default title, or when it detects a title change it cannot attribute to its own verified write. This conservatively protects manual edits and OpenCode auto-titles. To rename a locked session, obtain user-authorised permission to unlock with `stm_title_lock` using the live `expectedTitle`, read the live title and state again, then make a fresh rename without a review ID cleared by unlocking. Automatic reviews never unlock a session, and permission denial means stop.
 
-Startup bootstrap behaviour:
+## Optional background reviewer
 
-- An existing configuration file is never overwritten: it is preserved byte-for-byte, including empty, invalid and dangling-symlink entries. An existing invalid or unreadable file still disables the plugin (see Setup for the diagnostic detail).
-- The generated file contains only the defaults above, so no additional tools or permissions become active: the three current-session tools are exposed as before and the historical tools remain disabled by default.
-- A missing file that cannot be created (for example an unwritable destination) or an unusable packaged template disables the plugin with a single diagnostic that contains no raw paths or file contents; there is no fallback to in-memory defaults.
-- If the configuration file is deleted, the next startup regenerates it from the packaged template.
+**Review input and cost:** STM sends the reviewer a snapshot of retained user/assistant text and compaction summaries visible at its outgoing-message hook—not the full stored history. Tool calls, tool results, and reasoning are excluded, but a summary may describe earlier tool activity. STM adds no size limit, truncation, or extra summarisation; the selected model's context limit applies and an over-limit request fails without a shortened-input retry. This text may contain secrets or personal data, is stored in the child session, and is sent to the selected provider, which may retain it. Dispatch makes an additional model call that consumes provider tokens and may incur cost.
 
-Configuration is read once at startup; restart OpenCode after any change. Tool definitions are fixed for the lifetime of the instance. Local state is stored under `$XDG_STATE_HOME/opencode-stm/` (or `~/.local/state/opencode-stm/`) using hashed session identifiers as filenames.
-
-## Behaviour and controls
-
-- Root agents and subagents can call the tools. `stm_title_read`, `stm_title_review` and `stm_title_lock` use the actual caller's session, not its parent or root ancestor. A subagent whose title is already non-default must explicitly unlock it before renaming, just like a root session. Automatic reminders remain root-only.
-- Reminders anchor to the most recent eligible message and recur at cumulative thresholds (20, 60, 140 eligible messages by default). The agent resolves each review with `stm_title_review` (`keep` or `rename`), which asks for permission first.
-- Locking is conservative: a session whose first observed title is not the native default is locked because its provenance is unknown, and a title change the plugin cannot attribute to its own verified write — including changes made by OpenCode's own auto-titling — locks the session and stops automatic injections. These comparisons are not a background watcher: the title is checked on first observation, on `stm_title_read`, before anchoring a new reminder, before replaying an unresolved review's reminders on each outgoing request, and when applying a keep/rename decision. Between those points the plugin does not watch for title changes. An explicit unlock (`stm_title_lock` with `locked: false`) opts the session back in.
-- Agents should call `stm_title_read` before considering a rename. It reports the lock reason, advisory `canRename` and next-step guidance. Locking blocks current-session renames as well as periodic reviews. For a user-authorised rename of a locked session, obtain normal unlock permission, unlock, re-read the live title and state, then submit a fresh rename without a review ID cleared by unlocking. Unlocking resets the scheduling baseline and may resume enabled periodic reviews. Automatic reviews must never unlock themselves; a permission denial means stop, not retry through another route. Read-time eligibility does not replace the final permission, lock and expected-title checks.
-- Title writes have no compare-and-swap. The plugin re-checks the title immediately before writing and reads back after, but it cannot guarantee conflict detection: a manual edit that lands between the pre-write check and the write can be overwritten while the write reports success. Detected mismatches produce `conflict` or `uncertain` results, and the plugin never retries a failed or uncertain write automatically.
-
-### Background title reviewer (opt-in)
-
-Setting `review.reviewer` exposes `stm_title_review_start` and changes due reminders to ask the main agent to dispatch the pending review and continue its task. Reviews must also be enabled with `review.enabled: true`. STM registers the hidden `session-title-reviewer` subagent at startup, including its prompt and deny-all tool permissions. No separate agent file or `opencode.json` agent entry is needed. To inherit the dispatching conversation's model and variant:
+To let STM dispatch due reminders to its built-in reviewer, enable reviews and add a reviewer block:
 
 ```yaml
 review:
@@ -134,77 +62,65 @@ review:
   reviewer: {}
 ```
 
-Alternatively, set `review.reviewer.model: provider/model-id` to use that exact model without inheriting the dispatch variant. Empty or malformed model values disable STM with a setting-scoped startup error. Unknown models, disconnected providers and catalogue failures are reported at dispatch; provider rejection is reported during execution. There is no fallback to another model. Catalogue checks happen after startup and cannot guarantee inference availability. Omitting `reviewer` entirely retains main-agent reviews. Restart OpenCode after configuration changes.
+The reviewer is a hidden, tool-disabled subagent registered by STM; no separate agent file or `opencode.json` agent entry is needed. By default it inherits the dispatching conversation's model and variant. Set `review.reviewer.model: provider/model-id` to select an exact model instead; STM does not fall back to another model. `review.reviewer.timeoutSeconds` defaults to 120 (allowed range: 10–600). Restart OpenCode after editing the configuration.
 
-**Migrating an existing configuration:** remove `review.reviewer.agent` and the entire `review.reviewer.transcript` block. `includeToolCalls`, `includeToolResults` and `maxBytes` are no longer supported; obsolete settings produce an error rather than being silently ignored. There is no replacement size-limit setting. Move any desired model choice into `review.reviewer.model`. STM replaces the runtime definition for its owned `session-title-reviewer` name, but does not edit existing agent files, `opencode.json` or your existing `config.yaml`.
+> [!IMPORTANT]
+> When upgrading from the earlier external-reviewer configuration, remove `review.reviewer.agent` and the whole `review.reviewer.transcript` block, including `includeToolCalls`, `includeToolResults`, and `maxBytes`. These settings are rejected and disable STM; there is no replacement input-size cap. Put any model choice in `review.reviewer.model`.
 
-Dispatch and execution:
+Dispatch requires the normal OpenCode permissions. A `queued` result only confirms admission, not completion; after an error or timeout, inspect the live title before retrying. Once dispatch is authorised, STM applies a valid keep/rename decision without a separate conversational confirmation. A plugin restart does not resume result application, and a child session may remain in OpenCode history.
 
-- The main agent calls `stm_title_review_start` with the pending `reviewID`, the reminder's fresh `contextID`, the current `expectedTitle`, and optionally `retry: true` after an explicit failure. The call asks normal OpenCode permissions for the dispatch tool, `task` targeting `session-title-reviewer` and the parent review. A denial or abort before acceptance creates no child and discloses no conversation text to a reviewer, and the compact result is only a `queued` acknowledgement, not a claim that the review completed.
-- The reviewer runs in a stored child session while the parent continues its own turns. Reviewer text, reasoning and its decision are not appended to the parent and do not wake it. STM validates the child's completed visible response as exactly one JSON object, then applies a keep or rename itself.
-- Reviewer input is an immutable snapshot of retained user/assistant text, including retained compaction summaries, visible to STM's outgoing-message transform for the dispatch turn. It is not reconstructed from the complete stored history. Tool calls/results, reasoning, files, nested child conversations and STM reminders are excluded; text summaries may still describe earlier tool activity. The reviewer receives its own instructions, not the main agent's system prompt. Context tokens and the dispatch assistant's parent-message identity reject missing, stale or mismatched snapshots rather than substituting another turn's input.
-- Other plugins can transform messages after STM, so the snapshot is guaranteed only at STM's hook boundary, not to equal the final provider request. STM adds no byte/token ceiling, truncation, extra summarisation or context-budget preflight. The selected model's native context limit still applies; an over-limit request fails without shortened-input retries or fallback. A model with a smaller context window than the main model may therefore reject the review.
-- Decisions are autonomous once dispatch is authorised: there is no separate conversational confirmation of the proposed title. Normal permission rules remain authoritative, including a restrictive parent session; the child receives the parent's non-allow restrictions plus a final deny-all rule and has no shell, edit, nested delegation or STM tools.
-- An invalid result, provider error or failure before title application leaves the title unchanged and shows a concise TUI notice when available, otherwise a fixed diagnostic. A timeout can abort an in-flight rename after the host may already have committed the title update, so STM records an uncertain outcome rather than claiming the title was unchanged. After a timeout or other uncertain result, check the live title and reconcile it with the existing explicit title controls; nothing is retried automatically. Repeated ordinary dispatches do not create another worker. A later explicit retry requires `retry: true`; an uncertain title write cannot be retried until the live title and stored state have been reconciled. An unconfirmed child stop blocks replacement.
-- After a restart STM does not resume result application. It reconciles stored work lazily on the next root activity or dispatch, within the stored deadline and ownership rules. A crashed plugin cannot guarantee exactly-once cleanup: a raw child session may outlive it, and its history is retained for inspection rather than deleted by STM.
+## Historical session access
 
-Visibility, disclosure and cost:
+Historical tools are independently disabled by default. Enable only the access you need:
 
-- The child is excluded from the normal root-session picker but remains visible through child navigation, explicit session APIs and separate session export. A normal parent export does not include the child transcript.
-- Reviewer mode sends retained conversation text and summaries to the selected reviewer provider. That text may contain secrets or personal data; tool exclusion reduces disclosure but does not redact it. The prompt is stored in the child session, and the provider may retain its own copies. The extra child model call consumes provider tokens and may incur cost. `historical.readTranscript` is independent: it controls the main agent's tools for reading other saved root sessions, not the background reviewer's input.
-- `session.deleted` revocation and metadata deletion are best effort and ordered before other cleanup, but they do not delete OpenCode's stored child session or provider-side copies. Previously inspected child history remains available.
-- OpenCode title writes have no compare-and-swap. A manual title edit between STM's final check and its write can still be overwritten while the guessed write reports success; the existing documented limitation remains.
-
-The plugin performs no global setup changes.
-
-## Historical access (opt-in)
-
-All historical tools are disabled by default. Each flag independently exposes its own tool; enabling a flag never exposes the other tools. Enabling `historical.readTranscript` sends selected historical transcript content to the active model provider.
-
-The flags do not grant user authorisation and do not override OpenCode permission prompts: every mutating action and every historical read asks through the normal allow/ask/deny policy. Note that headless invocations such as `opencode run` cannot be assumed to present an interactive permission prompt.
-
-Subagents use the same opt-in flags and target-scoped permission checks. Historical tools reject self-targets; use current-session tools for the caller's own title. Historical title reads may inspect root or child metadata, but historical transcript reads and renames accept root targets only. Pagination bindings, issued cursors and sensitive blocks belong to the actual caller session: parent and sibling callers do not share them, and a sensitive block is not inherited across the session tree. Each caller must obtain its own permissions and pagination state.
-
-Each `stm_history_transcript` call fetches one page of up to 8 messages and returns its bounded chunk directly as the tool result: one JSON metadata header line, a blank line, then the untrusted frame. The frame starts and ends with fixed marker lines; the `Target session` and `cursor` values in its header are JSON string encoded so arbitrary values stay on one physical line. Between the warning line and the terminating marker the payload is JSON Lines: every line is one complete JSON record and parses directly with `JSON.parse`, with no legacy backslash or frame-marker escaping. The result is at most 16 KiB and 1,999 lines, counting the header, separators, framing and record serialization. Under OpenCode 1.18.35's default per-result truncation limits (50 KiB and 2,000 lines), every returned result fits the predicate; late message transformations such as DCP 3.2.0 markers are applied after truncation with no second pass, so they do not cause additional spill. A lower configured host limit can still truncate a result. The first fetch returns the newest page; entries within a page are chronological, and each subsequent page, requested using STM's saved bookmark, is older.
-
-Each record is a complete, independently parseable line with exactly these fields:
-
-```json
-{"role":"user","messageID":"msg_123","partIndex":0,"offsetBytes":0,"partComplete":true,"text":"Please fix this"}
+```yaml
+historical:
+  readTitles: false
+  renameTitles: false
+  readTranscript: false
 ```
 
-- `role` is `user` or `assistant`. Ordinary user messages are retained even when the stored message carries summary metadata such as `{diffs: []}`; only assistant messages with `summary === true` are excluded, alongside non-text, synthetic, ignored and unsupported-role parts. No role is inferred by alternating turns or by reading content, so consecutive user messages and consecutive assistant messages remain distinct records.
-- `messageID` and `partIndex` identify the stored message and the index of the text part in that message's original parts array; excluded parts (reasoning, tools, synthetic text) are not renumbered, so indices can have gaps.
-- `offsetBytes` is the UTF-8 byte offset of this fragment within that text part, and `partComplete` is true only when the fragment reaches the end of the stored text part. `partComplete` never means the assistant finished its response or task: a session stopped mid-response is returned with the assistant text that was saved, and a session stopped with no assistant text yields no assistant record at all.
-- `text` is the exact source slice. Quotes, backslashes, newlines, carriage returns and control characters use JSON string encoding, so a cut can land anywhere and still round-trip through `JSON.parse`.
+- `historical.readTitles` exposes `stm_history_title_read` for another session's title and root/child metadata.
+- `historical.renameTitles` exposes `stm_history_title_rename` for explicitly renaming another root session.
+- `historical.readTranscript` exposes `stm_history_transcript` and `stm_history_review_end` for reviewing another root session's visible text.
 
-To reassemble history, parse every payload line, group records by `messageID` and `partIndex`, order them as delivered (each later fragment for an identity continues at the accumulated UTF-8 byte count, and never follows a `partComplete: true` record), and concatenate `text` with no invented separators.
+These settings expose tools; they do not grant user authorisation or bypass OpenCode's normal allow/ask/deny policy. Each operation still asks through that policy. Headless commands such as `opencode run` cannot be assumed to present an interactive permission prompt. Historical title reads may inspect root or child metadata, but transcript reads and historical renames accept root sessions only. Use current-session tools for the caller's own title.
 
-The result is an ordinary stored tool result: OpenCode persists the returned text in the session history, and the result becomes eligible for the model context like any other tool result. Persisted history and model context are separate: compaction and other host context management can drop, prune or summarise a result from later model-context windows without erasing the original stored tool-result text. Each additional retrieved chunk therefore grows context usage and input-token consumption, subject to the host's context management. Nothing forces the agent to review a result in the same turn, and nothing deletes the stored result at turn end; the plugin cannot retract a result it has already returned. `messages` counts the text parts completed in the result (not distinct messages), so a chunk that ends mid-part can report 0; `bytes` counts delivered source-text UTF-8 bytes only, excluding record serialization, framing and separators.
+Transcript reads return visible user/assistant text only—not reasoning or tool bodies, although a text summary may describe earlier tool activity. Each call returns one bounded chunk (up to 16 KiB and 1,999 lines, from a page of up to eight messages) as framed JSON Lines. Each record has `role`, `messageID`, `partIndex`, `offsetBytes`, `partComplete`, and `text`; `partComplete` marks the end of that source text part, not completion of the assistant's task. Continue with the same `sessionID` and omit `cursor` to let STM resume. Each result is stored in OpenCode session history as an ordinary tool result and may enter model context. A `sensitive` outcome blocks this caller's further transcript reads and historical renames for that target, but does not block separately permitted title-metadata reads or erase text already returned or stored.
 
-The `continuation` field states what to do next: when `complete` is true, stop calling. Otherwise, call again with only the same `sessionID`: STM remembers the position within a partial page and advances automatically when that page is exhausted. A failed next-page read leaves the saved bookmark retryable: retry without a cursor, and a successful read advances the page exactly once. The optional `cursor` argument remains supported for compatibility, but must match exactly; after a mistyped cursor is rejected, omit it to resume from the saved position. Normal calls do not need to copy opaque cursors or include them in OpenCode's tool-call labels. Pagination state is metadata-only (target, offsets, committed and issued cursors, page number and a page digest; no transcript text) and has no TTL; at most 16 caller bindings exist, and a page that changes under partially consumed offsets fails closed and requires a restart. `stm_history_review_end` releases the caller's binding but does not erase results already returned; a `sensitive` outcome also blocks further transcript reads and renames of that target.
+## Privacy and safety
 
-A successful call commits its offsets and detaches the request abort listener before returning, so the host's post-success signal teardown does not invalidate the continuation. An abort during the call, before the commit, discards the fetched text and ends the caller's binding. Continuation uses only bookmarks held by the plugin for that caller and target; explicit foreign cursors are rejected, and the plugin does not follow arbitrary Link URLs.
+- STM's state is stored under `$XDG_STATE_HOME/opencode-stm/`, or `~/.local/state/opencode-stm/` by default. Its files use hashed session IDs as filenames and contain metadata such as counters, title digests, lock state, message identifiers, and background-review IDs—not raw titles or transcript text. This metadata is not described as encrypted.
+- Historical transcript results and background-review prompts are different: OpenCode stores them in session history, and the selected model provider receives their content. Ending a historical review, including with `sensitive`, does not delete results already returned or provider-side copies.
+- Title writes have no compare-and-swap. STM checks the title before and after a write, but a manual edit between the final check and the write can still be overwritten; a reported success is not conflict-proof.
 
-## Privacy boundaries
+## Build, validation, and compatibility
 
-Historical access is disabled by default. Transcript review sends selected content to the active model provider as an ordinary tool result: OpenCode persists the returned text in the session history, and the result becomes eligible for the provider context like any other tool result. Later context management, including compaction, can drop, prune or summarise it from the model context without erasing the stored original. This is intended behaviour, not an incidental exposure, and the plugin cannot retract what it has returned.
+For an alternate source-checkout install, use Node.js 24 or newer and npm:
 
-- Title reminders are injected transiently into the outgoing request and are never persisted to the stored conversation. In reviewer mode, the collected review prompt is persisted in the child session because it is an ordinary child prompt; it is not appended to the parent. Transcript results are not transient: the returned text is the stored tool result itself. This is not an end-to-end non-persistence guarantee, and compaction summaries may retain excerpts of the conversation.
-- Provider-side prompt cache and billing effects of the returned text have not been measured; an offline byte-stability check does not cover them.
-- The direct-result code is exercised only against the fake SDK. No live-wire run has observed how it presents on the provider wire: the released 0.2.1 loopback evidence (chat-completions-style and OpenAI Responses-style formats, reminder conversion and DCP 3.2.0 in both orders) covered the superseded deferred-delivery design and does not apply to it. The 0.3.1 attributed-history and 0.4.0 subagent changes are covered the same way, by the fake SDK only, with no new live-wire run. Anthropic conversion is not verified, and the real OpenAI endpoint's handling has not been observed (no paid provider calls were made).
-- Other plugins that capture or log outgoing messages can record injected reminders and transcript results; observed diagnostic exposure of that kind occurred when the capturing plugin's own debug output was enabled.
-- STM's own state files are metadata-only: hashed session identifiers are used as file names, and the stored metadata contains counters, title digests, lock state, raw message and part identifiers used for anchoring and replay protection, plus the background attempt's owner marker, child session ID and prompt message ID when reviewer mode is used. It contains no raw titles or transcript text. Pagination state is in-memory metadata only. Transcript text lives in the OpenCode session history as the returned tool result, not in STM's files. `stm_history_review_end`, including a sensitive outcome, releases pagination state but cannot erase text already returned or stored.
+```sh
+npm install
+npm run build
+```
 
-## Releasing
+Register the built plugin by absolute path, then restart OpenCode:
 
-Publication is automated by `.github/workflows/publish.yml`, which runs on a published, non-prerelease GitHub Release:
+```json
+{
+  "plugin": ["/absolute/path/to/opencode-stm/dist/src/index.js"]
+}
+```
 
-1. Bump `version` in `package.json` and both root `version` fields in `package-lock.json`.
-2. Commit and push `main`, then create a stable tag named `vX.Y.Z` that matches the package version.
-3. Publish the GitHub Release for that tag. A build job checks out the release tag, rejects a tag/version mismatch or an already published version, runs `npm run typecheck` and the full test suite, then packs `opencode-stm-<version>.tgz`; a separate publish job downloads that tarball and runs `npm publish ./release/*.tgz --ignore-scripts --access public` with npm OIDC (`id-token: write`). Prereleases are skipped.
+Run the project checks with:
 
-npm trusted publishing must be configured on npmjs.com for the `DrTralala/opencode-stm` repository and the `publish.yml` workflow, with no environment and no stored npm token. The OIDC token exists only in the publish job, which installs no dependencies and runs no package lifecycle scripts; the build job that runs `npm ci`, the tests and the pack has read-only repository permissions. The runner's Node 24 bundles an npm that supports OIDC, so no global npm install is required. After a run, verify the published version, dist-tag and provenance on npm.
+```sh
+npm run typecheck
+npm test
+```
+
+The current direct-result implementation is covered by fake-SDK tests, not a paid-provider run. The background reviewer also has compiled-plugin loopback coverage against a local OpenCode 1.19.5 host with a fake OpenAI-compatible provider. Earlier OpenCode 1.18.35 loopback checks covered the superseded 0.2.1 deferred-delivery design; they do not establish wire compatibility for the current implementation. No live provider call was made, and these isolated checks do not establish general compatibility with other OpenCode versions, the real OpenAI endpoint, or Anthropic.
+
+Publishing is automated by [`.github/workflows/publish.yml`](.github/workflows/publish.yml) on a published stable GitHub Release. The build job validates the tag/package version, runs the typecheck and tests, and packs the npm package; a separate job publishes with npm OIDC trusted publishing rather than a stored npm token. Verify the published version, dist-tag, and provenance after a release.
 
 ## Licence
 
